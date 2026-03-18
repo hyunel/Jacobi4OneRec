@@ -1,0 +1,5 @@
+model/
+*.parquet
+*.safetensors
+*.pt
+*.bin
