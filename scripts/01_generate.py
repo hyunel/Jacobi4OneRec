@@ -51,7 +51,7 @@ def load_data():
     data1 = load_dataset("parquet", data_files=[
         "data/OpenOneRec/output/sft_rec_reason.parquet",
         "data/OpenOneRec/output/sft_video_rec.parquet",
-    ], split="train").select_columns(["messages"])
+    ], split="train", streaming=True).select_columns(["messages"])
 
     data2 = load_dataset("parquet", data_files=[
         "data/OpenOneRec/raw_data/general_text/sft/filtered_0_000000.parquet",
@@ -59,12 +59,13 @@ def load_data():
         "data/OpenOneRec/raw_data/general_text/sft/filtered_2_000000.parquet",
         "data/OpenOneRec/raw_data/general_text/sft/filtered_3_000000.parquet",
         "data/OpenOneRec/raw_data/general_text/sft/filtered_4_000000.parquet",
-    ], split="train").select_columns(["messages"]).cast(Features({"messages": Value("large_string")}))
+    ], split="train", streaming=True).select_columns(["messages"]).cast(Features({"messages": Value("large_string")}))
 
-    data = (concatenate_datasets([data1, data2], axis=0)
+    data = (concatenate_datasets([data2], axis=0)
         .map(lambda x: {
             "messages": convert_messages(json.loads(x["messages"])[:-1])
         })
+        .batch(2)
         .shuffle())
     return data
 
@@ -88,9 +89,9 @@ def main(args: argparse.Namespace):
 
     dataset = load_data()
     with pq.ParquetWriter(args.output, schema) as writer:
-        for prompt in track(dataset, description="Processing"):
+        for batch in dataset:
             prompts = tokenizer.apply_chat_template(
-                [prompt['messages']], # TODO: support batch size > 1
+                batch['messages'], # TODO: support batch size > 1
                 tokenize=False,
                 add_generation_prompt=True
             )
@@ -131,8 +132,8 @@ def main(args: argparse.Namespace):
                 generated_ids = torch.cat((generated_ids, answer_trajectory_ids[-1]), dim=-1) # concat blocks
 
                 for i in active_idx:
-                    generated_str = ''.join(tokenizer.decode(answer_trajectory_ids[-1], skip_special_tokens=False))
-                    console.print(generated_str, end='')
+                    generated_str = ''.join(tokenizer.decode(answer_trajectory_ids[-1][i], skip_special_tokens=False))
+                    console.print('batch_idx:', i.item(), 'n_block:', n_block, '\n', generated_str, end='\n\n')
 
                     # dict_lst.append({
                     #     "n_block": n_block,
