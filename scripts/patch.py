@@ -3,7 +3,12 @@ from typing import Optional, List
 
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.cache_utils import Cache, DynamicCache, DynamicLayer, DynamicSlidingWindowLayer
-from transformers.generation.logits_process import LogitsProcessorList
+from transformers.generation.logits_process import (
+    LogitsProcessorList,
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -60,11 +65,26 @@ def forward_jacobi(
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
     past_key_values: Optional[Cache] = None,
+    temperature: float = 1.0,
+    top_k: int = 0,
+    top_p: float = 1.0,
+    accept_threshold: float = 0.0,
     **kwargs
 ):
-    logits_processors = LogitsProcessorList(
+    logits_processors = LogitsProcessorList()
+    if temperature != 1.0:
+        logits_processors.append(TemperatureLogitsWarper(temperature))
+    if top_k != 0:
+        logits_processors.append(TopKLogitsWarper(top_k=top_k, min_tokens_to_keep=1))
+    if top_p < 1.0:
+        logits_processors.append(TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=1))
 
-    )
+    do_sample = (temperature != 1.0 or top_k != 0 or top_p < 1.0)
+
+    def _pick(probs):
+        if do_sample:
+            return torch.multinomial(probs, num_samples=1)
+        return torch.argmax(probs, dim=-1, keepdim=True)
 
     # Stage1: Prefill
     if past_key_values is None:
@@ -109,9 +129,9 @@ def forward_jacobi(
 
         hidden_states = self.model.norm(hidden_states)
         logits = self.lm_head(hidden_states).float()
-        scores = logits_processors(input_ids, logits)
+        scores = logits_processors(input_ids, logits[:, -1, :])
         probs = torch.nn.functional.softmax(scores, dim=-1)
-        next_token = torch.argmax(probs[:, -1, :], dim=-1, keepdim=True)
+        next_token = _pick(probs)
 
         return past_key_values, next_token
 
@@ -133,7 +153,7 @@ def forward_jacobi(
     #   [
     #      [accepted_0 , ..., accepted_k, anchor, draft... ],
     #      [accepted_0, ..., anchor, draft...              ],
-    #      ...                 └─ [1, n_accepted]
+    #      ...                 └─ [B, n_accepted]
     #   ]
     out = input_ids.clone()
 
@@ -143,7 +163,7 @@ def forward_jacobi(
     next_tokens = torch.zeros(B, 1, dtype=input_ids.dtype, device=device)
     past_kv_fin = empty_like(past_key_values, extra_seq=L)
 
-    trajectory = [[] for _ in range(B)]
+    trajectory = [[ input_ids[i] ] for i in range(B)]
     while True:
         # Select unfinished samples
         idx_unfin = unfinished_mask.nonzero(as_tuple=False).squeeze(1)
@@ -196,26 +216,30 @@ def forward_jacobi(
 
         # Per-sample verification & draft rebuild
         for n, orig_idx in enumerate(idx_unfin.tolist()):
-            p_scores = logits_processors(out[orig_idx:orig_idx+1], logits[n:n+1])
-            p_prob = torch.nn.functional.softmax(p_scores, dim=-1)
-
             anchor_idx = total_accepted[orig_idx].item()
-            draft_tokens = out_unfin[n:n+1, anchor_idx+1:] # skip first input token (anchor)
-            greedy_tokens = torch.argmax(p_prob[:, anchor_idx:-1, :], dim=-1) # skip last token (next token)
+            draft_tokens = out_unfin[n:n+1, anchor_idx+1:]
 
-            mismatch = (draft_tokens != greedy_tokens)
+            # TODO: implement non-greedy acceptance here
+            # p_scores = logits_processors(out[orig_idx:orig_idx+1], logits[n:n+1])
+            p_prob = torch.nn.functional.softmax(logits[n:n+1], dim=-1)
+
+            if do_sample:
+                draft_probs = p_prob[:, anchor_idx:-1, :].gather(-1, draft_tokens.unsqueeze(-1)).squeeze(-1)
+                mismatch = draft_probs < accept_threshold
+            else:
+                greedy_tokens = torch.argmax(p_prob[:, anchor_idx:-1, :], dim=-1)
+                mismatch = (draft_tokens != greedy_tokens)
             n_matched = (mismatch.cumsum(dim=-1) == 0).sum(dim=-1)[0].item()
 
             total_accepted[orig_idx] += n_matched + 1
 
-            next_token = torch.argmax(p_prob[:, anchor_idx + n_matched, :], dim=-1, keepdim=True)[0]
+            next_token = _pick(p_prob[:, anchor_idx + n_matched, :])[0]
             next_tokens[orig_idx] = next_token
 
             # If draft is not fully accepted
             if total_accepted[orig_idx] < L:
-                # Rebuild draft from remaining logits
                 q_probs_rem = p_prob[:, anchor_idx + n_matched + 1:-1, :]
-                new_draft = torch.argmax(q_probs_rem, dim=-1).squeeze(0)
+                new_draft = _pick(q_probs_rem.squeeze(0)).squeeze(-1)
 
                 # Update out
                 out[orig_idx] = torch.cat([
@@ -223,6 +247,8 @@ def forward_jacobi(
                     next_token, # next token becomes new anchor
                     new_draft, # draft tokens
                 ])
+
+                trajectory[orig_idx].append(out[orig_idx].clone())
             else:
                 # Save final KV cache
                 merge_batch(
@@ -230,8 +256,6 @@ def forward_jacobi(
                     select_batch(past_kv_unfin, [n]),
                     [orig_idx]
                 )
-
-            trajectory[orig_idx].append(out[orig_idx].clone())
 
         unfinished_mask = total_accepted < L
         if not unfinished_mask.any():

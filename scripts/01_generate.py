@@ -4,17 +4,19 @@ import argparse
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
-from collections import defaultdict
-from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2ForCausalLM, AutoProcessor, Qwen3ForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, concatenate_datasets, Features, Value
-from rich.progress import track
 from rich.console import Console
+from rich.progress import Progress
 from patch import forward_jacobi
 
-# ~40M input tokens
-
 console = Console()
-SCHEMA = pa.schema([])
+SCHEMA = pa.schema([
+    ("uuid", pa.string()),
+    ("source", pa.string()),
+    ("prompt_ids", pa.list_(pa.int32())),
+    ("blocks", pa.list_(pa.list_(pa.list_(pa.int32())))),
+])
 
 def convert_messages(messages):
     msg_list = []
@@ -47,27 +49,26 @@ def convert_messages(messages):
             raise ValueError(f"Unsupported content type: {type(content)}")
     return msg_list
 
-def load_data():
-    data1 = load_dataset("parquet", data_files=[
-        "data/OpenOneRec/output/sft_rec_reason.parquet",
-        "data/OpenOneRec/output/sft_video_rec.parquet",
-    ], split="train", streaming=True).select_columns(["messages"])
+def load_data(dataset_paths, batch_size):
+    datasets = [
+        load_dataset("parquet", data_files=[str(path)], split="train", streaming=True)
+            .select_columns(["messages", "uuid", "source"])
+            .cast(Features({
+                "messages": Value("large_string"),
+                "uuid": Value("string"),
+                "source": Value("string")
+            }))
+        for path in dataset_paths
+    ]
 
-    data2 = load_dataset("parquet", data_files=[
-        "data/OpenOneRec/raw_data/general_text/sft/filtered_0_000000.parquet",
-        "data/OpenOneRec/raw_data/general_text/sft/filtered_1_000000.parquet",
-        "data/OpenOneRec/raw_data/general_text/sft/filtered_2_000000.parquet",
-        "data/OpenOneRec/raw_data/general_text/sft/filtered_3_000000.parquet",
-        "data/OpenOneRec/raw_data/general_text/sft/filtered_4_000000.parquet",
-    ], split="train", streaming=True).select_columns(["messages"]).cast(Features({"messages": Value("large_string")}))
-
-    data = (concatenate_datasets([data1, data2], axis=0)
+    return (concatenate_datasets(datasets, axis=0)
         .map(lambda x: {
+            **x,
             "messages": convert_messages(json.loads(x["messages"])[:-1])
         })
-        .batch(2)
-        .shuffle())
-    return data
+        .batch(batch_size)
+        .shuffle()
+    )
 
 def main(args: argparse.Namespace):
     model = AutoModelForCausalLM.from_pretrained(
@@ -87,93 +88,96 @@ def main(args: argparse.Namespace):
         'max_new_seq_len': str(args.max_new_seq_len),
     })
 
-    dataset = load_data()
-    with pq.ParquetWriter(args.output, schema) as writer:
-        for batch in dataset:
-            prompts = tokenizer.apply_chat_template(
-                batch['messages'], # TODO: support batch size > 1
-                tokenize=False,
-                add_generation_prompt=True
-            )
-
-            model_inputs = tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True
-            ).to(model.device)
-
-            B, L = model_inputs["input_ids"].shape
-
-            # Prefill Phase
-            past_key_values, next_token = model.forward_jacobi(
-                input_ids=model_inputs["input_ids"],
-                attention_mask=model_inputs["attention_mask"], # For padding tokens in the prompt
-                past_key_values=None,
-                n_token_seq_len=args.n_token_seq_len,
-                tokenizer=tokenizer,
-            )
-
-            # Generation Phase
-            generated_ids = model_inputs["input_ids"]
-            for n_block in range((args.max_new_seq_len + args.n_token_seq_len - 1) // args.n_token_seq_len):
-                active_idx = (~(generated_ids[:, L:] == tokenizer.eos_token_id).any(dim=1)).nonzero(as_tuple=True)[0]
-                if len(active_idx) == 0:
-                    break
-
-                q_sampled = torch.randint(0, tokenizer.vocab_size, (B, args.n_token_seq_len-1), device=model.device)
-                past_key_values, next_token, trajectory = model.forward_jacobi(
-                    input_ids=torch.cat((next_token, q_sampled),dim=-1),
-                    attention_mask=None,
-                    past_key_values=past_key_values,
-                    n_token_seq_len=args.n_token_seq_len,
-
-                    tokenizer=tokenizer,
+    dataset = load_data(args.dataset, args.batch_size)
+    progress = Progress(console=console)
+    with pq.ParquetWriter(args.output, schema) as writer, progress:
+        task = progress.add_task("Generating...", total=None)
+        try:
+            for batch in dataset:
+                progress.advance(task)
+                prompts = tokenizer.apply_chat_template(
+                    batch['messages'],
+                    tokenize=False,
+                    add_generation_prompt=True
                 )
-                generated_ids = torch.cat((generated_ids, torch.stack([traj[-1] for traj in trajectory])), dim=-1) # concat blocks
 
-                for i in active_idx:
-                    generated_str = ''.join(tokenizer.decode(trajectory[i][-1], skip_special_tokens=False))
-                    console.print('batch_idx:', i.item(), 'n_block:', n_block, '\n', generated_str, end='\n\n')
+                model_inputs = tokenizer(
+                    prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True
+                ).to(model.device)
 
-                    # dict_lst.append({
-                    #     "n_block": n_block,
-                    #     "n_batch": i,
-                    #     "prompt_ids": generated_ids[:, :-args.n_token_seq_len].cpu(),
-                    #     "trajectory": [step[0].cpu() for step in answer_trajectory_ids],
-                    #     "teacher_output_ids": generated_ids[i].cpu()
-                    # })
+                if any(len(tokens) > args.max_prompt_len for tokens in model_inputs["input_ids"]):
+                    console.print("[red]Warning: Some prompts exceed the maximum prompt length, skipping these samples.[/red]")
+                    continue
 
-    print(f'Finishing diffusion decoding...', flush=True)
-    grouped_by_data_id = defaultdict(list)
-    for dic in dict_lst:
-        grouped_by_data_id[dic["data_id"]].append(dic)
+                B, L = model_inputs["input_ids"].shape
 
-    new_data = []
-    for data_id, group in grouped_by_data_id.items():
-        best_teacher_output = max(group, key=lambda x: len(x["teacher_output_ids"]))["teacher_output_ids"]
-        for dic in group:
-            dic["teacher_output_ids"] = best_teacher_output
-            # Now convert to list for JSON
-            dic["prompt_ids"] = dic["prompt_ids"].tolist()
-            dic["answer_trajectory_ids"] = [a.tolist() for a in dic["answer_trajectory_ids"]]
-            dic["teacher_output_ids"] = dic["teacher_output_ids"].tolist()
-            new_data.append(dic)
+                # Prefill Phase
+                past_key_values, next_token = model.forward_jacobi(
+                    input_ids=model_inputs["input_ids"],
+                    attention_mask=model_inputs["attention_mask"], # For padding tokens in the prompt
+                    past_key_values=None,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    accept_threshold=args.accept_threshold,
+                )
 
-    with open(new_file_path, "w") as f:
-        json.dump(new_data, f)
+                # Generation Phase
+                trajectories = [[] for _ in range(B)]
+                for _ in range((args.max_new_seq_len + args.n_token_seq_len - 1) // args.n_token_seq_len):
+                    active_idx = [
+                        i for i, traj in enumerate(trajectories)
+                        if (not traj) or (not (traj[-1][-1] == tokenizer.eos_token_id).any())
+                    ]
+
+                    q_sampled = torch.randint(0, tokenizer.vocab_size, (B, args.n_token_seq_len-1), device=model.device)
+                    past_key_values, next_token, trajectory = model.forward_jacobi(
+                        input_ids=torch.cat((next_token, q_sampled),dim=-1),
+                        attention_mask=None,
+                        past_key_values=past_key_values,
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                        top_p=args.top_p,
+                        accept_threshold=args.accept_threshold,
+                    )
+
+                    for i in active_idx:
+                        trajectories[i].append(trajectory[i])
+                        decoded = tokenizer.decode(trajectory[i][-1], skip_special_tokens=False)
+                        console.print(f"[dim][Sample {i}][/dim] {decoded}")
+
+                # Write batch to parquet
+                masks = model_inputs["attention_mask"].bool()
+                writer.write_table(pa.table({
+                    "prompt_ids": [p[m].tolist() for p, m in zip(model_inputs["input_ids"], masks)],
+                    "blocks": [
+                        [[step.tolist() for step in block] for block in blocks]
+                        for blocks in trajectories
+                    ],
+                    "uuid": batch["uuid"],
+                    "source": batch["source"],
+                }, schema=schema))
+        except Exception as e:
+            console.print("[red]Generation interrupted. Saving progress...[/red]")
+            console.print(f"[red]Error: {e}[/red]")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--output", "-o", type=Path, default='output')
+    parser.add_argument("--dataset", type=Path, action="append", help="Path(s) to input dataset(s) in Parquet format.")
+    parser.add_argument("--output", "-o", type=Path, default='output.parquet', help="Path to output Parquet file.")
     parser.add_argument("--n_token_seq_len", type=int, default=64)
-    parser.add_argument("--max_new_seq_len", type=int, default=16384)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--max_new_seq_len", type=int, default=8192)
+    parser.add_argument("--max_prompt_len", type=int, default=8192)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--model", type=str, required=True)
-    # parser.add_argument("--use_labels", action="store_true")
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=0)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--accept_threshold", type=float, default=0.98,
+                        help="Draft acceptance threshold for non-greedy decoding.")
     args = parser.parse_args()
 
     main(args)
-    # main(args.filename, model, tokenizer, args.n_token_seq_len, args.max_new_seq_len,
-    #      args.use_labels, args.data_bos_id, args.data_eos_id, args.batch_size, args.save_path)
