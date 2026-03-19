@@ -61,7 +61,7 @@ def load_data():
         "data/OpenOneRec/raw_data/general_text/sft/filtered_4_000000.parquet",
     ], split="train", streaming=True).select_columns(["messages"]).cast(Features({"messages": Value("large_string")}))
 
-    data = (concatenate_datasets([data2], axis=0)
+    data = (concatenate_datasets([data1, data2], axis=0)
         .map(lambda x: {
             "messages": convert_messages(json.loads(x["messages"])[:-1])
         })
@@ -122,17 +122,18 @@ def main(args: argparse.Namespace):
                     break
 
                 q_sampled = torch.randint(0, tokenizer.vocab_size, (B, args.n_token_seq_len-1), device=model.device)
-                past_key_values, next_token, answer_trajectory_ids = model.forward_jacobi(
+                past_key_values, next_token, trajectory = model.forward_jacobi(
                     input_ids=torch.cat((next_token, q_sampled),dim=-1),
                     attention_mask=None,
                     past_key_values=past_key_values,
                     n_token_seq_len=args.n_token_seq_len,
+
                     tokenizer=tokenizer,
                 )
-                generated_ids = torch.cat((generated_ids, answer_trajectory_ids[-1]), dim=-1) # concat blocks
+                generated_ids = torch.cat((generated_ids, torch.stack([traj[-1] for traj in trajectory])), dim=-1) # concat blocks
 
                 for i in active_idx:
-                    generated_str = ''.join(tokenizer.decode(answer_trajectory_ids[-1][i], skip_special_tokens=False))
+                    generated_str = ''.join(tokenizer.decode(trajectory[i][-1], skip_special_tokens=False))
                     console.print('batch_idx:', i.item(), 'n_block:', n_block, '\n', generated_str, end='\n\n')
 
                     # dict_lst.append({
