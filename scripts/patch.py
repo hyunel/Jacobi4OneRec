@@ -3,12 +3,6 @@ from typing import Optional, List
 
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.cache_utils import Cache, DynamicCache, DynamicLayer, DynamicSlidingWindowLayer
-from transformers.generation.logits_process import (
-    LogitsProcessorList,
-    TemperatureLogitsWarper,
-    TopKLogitsWarper,
-    TopPLogitsWarper,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +49,64 @@ def empty_like(cache: Cache, extra_seq: int) -> DynamicCache:
     return new_cache
 
 # ---------------------------------------------------------------------------
+# Sampling helpers
+# ---------------------------------------------------------------------------
+
+def _select_tokens(probs: torch.Tensor, do_sample: bool) -> torch.LongTensor:
+    if not do_sample:
+        return torch.argmax(probs, dim=-1)
+
+    vocab_size = probs.shape[-1]
+    samples = torch.multinomial(probs.reshape(-1, vocab_size), num_samples=1)
+    return samples.reshape(*probs.shape[:-1])
+
+def _softmax_with_temperature(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    if temperature <= 0.0:
+        temperature = 1.0
+    if temperature != 1.0:
+        logits = logits / temperature
+    return torch.softmax(logits, dim=-1)
+
+def _apply_top_k(probs: torch.Tensor, top_k: Optional[int]) -> torch.Tensor:
+    if top_k is None or top_k <= 0 or top_k >= probs.shape[-1]:
+        return probs
+
+    values, indices = torch.topk(probs, k=int(top_k), dim=-1)
+    filtered = torch.zeros_like(probs)
+    filtered.scatter_(-1, indices, values)
+    return filtered / filtered.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+def _apply_top_p(probs: torch.Tensor, top_p: Optional[float]) -> torch.Tensor:
+    if top_p is None:
+        return probs
+
+    top_p = float(top_p)
+    if top_p <= 0.0 or top_p >= 1.0:
+        return probs
+
+    sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+    cdf = torch.cumsum(sorted_probs, dim=-1)
+    keep = cdf <= top_p
+    keep[..., 0] = True
+    filtered = torch.where(keep, sorted_probs, torch.zeros_like(sorted_probs))
+    filtered = filtered / filtered.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    out = torch.zeros_like(probs)
+    out.scatter_(-1, sorted_indices, filtered)
+    return out
+
+def _build_probs_from_logits(
+    logits: torch.Tensor,
+    temperature: float,
+    top_k: Optional[int],
+    top_p: Optional[float],
+) -> torch.Tensor:
+    probs = _softmax_with_temperature(logits, temperature)
+    probs = _apply_top_k(probs, top_k)
+    probs = _apply_top_p(probs, top_p)
+    return probs
+
+# ---------------------------------------------------------------------------
 # Forward function
 # ---------------------------------------------------------------------------
 
@@ -67,9 +119,11 @@ def forward_jacobi(
     past_key_values: Optional[Cache] = None,
     **kwargs
 ):
-    logits_processors = LogitsProcessorList(
+    temperature = float(kwargs.get("temperature", 1.0))
+    top_k = kwargs.get("top_k", None)
+    top_p = kwargs.get("top_p", 1.0)
 
-    )
+    do_sample = temperature > 0.0
 
     # Stage1: Prefill
     if past_key_values is None:
@@ -117,9 +171,8 @@ def forward_jacobi(
 
         hidden_states = self.model.norm(hidden_states)
         logits = self.lm_head(hidden_states).float()
-        scores = logits_processors(input_ids, logits)
-        probs = torch.nn.functional.softmax(scores, dim=-1)
-        next_token = torch.argmax(probs[:, -1, :], dim=-1, keepdim=True)
+        last_probs = _build_probs_from_logits(logits[:, -1, :], temperature, top_k, top_p)
+        next_token = _select_tokens(last_probs, do_sample).unsqueeze(-1)
 
         return past_key_values, next_token
 
@@ -206,26 +259,27 @@ def forward_jacobi(
 
         # Per-sample verification & draft rebuild
         for n, orig_idx in enumerate(idx_unfin.tolist()):
-            p_scores = logits_processors(out[orig_idx:orig_idx+1], logits[n:n+1])
-            p_prob = torch.nn.functional.softmax(p_scores, dim=-1)
-
             anchor_idx = total_accepted[orig_idx].item()
+            p_logits = logits[n:n+1, anchor_idx:, :]
+            p_prob = _build_probs_from_logits(p_logits, temperature, top_k, top_p)
             draft_tokens = out_unfin[n:n+1, anchor_idx+1:] # skip first input token (anchor)
-            greedy_tokens = torch.argmax(p_prob[:, anchor_idx:-1, :], dim=-1) # skip last token (next token)
+            target_tokens = _select_tokens(p_prob[:, :-1, :], do_sample) # skip last token (next token)
 
-            mismatch = (draft_tokens != greedy_tokens)
+            mismatch = (draft_tokens != target_tokens)
             n_matched = (mismatch.cumsum(dim=-1) == 0).sum(dim=-1)[0].item()
 
             total_accepted[orig_idx] += n_matched + 1
 
-            next_token = torch.argmax(p_prob[:, anchor_idx + n_matched, :], dim=-1, keepdim=True)[0]
+            next_token = _select_tokens(
+                p_prob[:, n_matched, :], do_sample
+            ).unsqueeze(-1)[0]
             next_tokens[orig_idx] = next_token
 
             # If draft is not fully accepted
             if total_accepted[orig_idx] < L:
                 # Rebuild draft from remaining logits
-                q_probs_rem = p_prob[:, anchor_idx + n_matched + 1:-1, :]
-                new_draft = torch.argmax(q_probs_rem, dim=-1).squeeze(0)
+                q_probs_rem = p_prob[:, n_matched + 1:-1, :]
+                new_draft = _select_tokens(q_probs_rem, do_sample).squeeze(0)
 
                 # Update out
                 out[orig_idx] = torch.cat([

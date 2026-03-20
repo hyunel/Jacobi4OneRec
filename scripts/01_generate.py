@@ -140,7 +140,6 @@ def main(args: argparse.Namespace):
                     temperature=args.temperature,
                     top_k=args.top_k,
                     top_p=args.top_p,
-                    accept_threshold=args.accept_threshold,
                 )
 
                 # Generation Phase
@@ -174,7 +173,6 @@ def main(args: argparse.Namespace):
                         temperature=args.temperature,
                         top_k=args.top_k,
                         top_p=args.top_p,
-                        accept_threshold=args.accept_threshold,
                     )
 
                     for i in active_idx:
@@ -205,11 +203,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_new_seq_len", type=int, default=8192)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--accept_threshold", type=float, default=0.98,
-                        help="Draft acceptance threshold for non-greedy decoding.")
     args = parser.parse_args()
 
     main(args)
