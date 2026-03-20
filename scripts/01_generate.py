@@ -67,7 +67,7 @@ def load_data(dataset_paths, batch_size):
             "messages": convert_messages(json.loads(x["messages"])[:-1])
         })
         .batch(batch_size)
-        .shuffle()
+        .shuffle(seed=42)
     )
 
 def main(args: argparse.Namespace):
@@ -94,6 +94,11 @@ def main(args: argparse.Namespace):
         task = progress.add_task("Generating...", total=None)
         try:
             for batch in dataset:
+                if not any(u == '91b35870-a4ec-11f0-8f4b-946daee91278' for u in batch['uuid']):
+                    continue
+                for i in range(len(batch['uuid'])):
+                    console.print(f"[dim] Messages: {batch['messages'][i]}[/dim]")
+
                 progress.advance(task)
                 prompts = tokenizer.apply_chat_template(
                     batch['messages'],
@@ -108,16 +113,29 @@ def main(args: argparse.Namespace):
                     truncation=True
                 ).to(model.device)
 
-                if any(len(tokens) > args.max_prompt_len for tokens in model_inputs["input_ids"]):
-                    console.print("[red]Warning: Some prompts exceed the maximum prompt length, skipping these samples.[/red]")
-                    continue
+                input_ids = model_inputs["input_ids"]
+                attention_mask = model_inputs["attention_mask"]
 
-                B, L = model_inputs["input_ids"].shape
+                B, _ = input_ids.shape
+
+                # input_ids = model_inputs["input_ids"]
+                # print('Input IDs length:', len(input_ids[0]))
+                # while True:
+                #     out = model(input_ids)
+                #     next_token = torch.argmax(out.logits[:, -1, :], dim=-1)
+                #     input_ids = torch.cat((input_ids, next_token.unsqueeze(-1)), dim=-1)
+                #     print(tokenizer.decode(next_token[0].item(), skip_special_tokens=False), end="")
+                #     if (next_token == tokenizer.eos_token_id).any():
+                #         break
+                # continue
 
                 # Prefill Phase
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids = position_ids.masked_fill(attention_mask == 0, 0)
                 past_key_values, next_token = model.forward_jacobi(
-                    input_ids=model_inputs["input_ids"],
-                    attention_mask=model_inputs["attention_mask"], # For padding tokens in the prompt
+                    input_ids=input_ids,
+                    attention_mask=attention_mask, # For padding tokens in the prompt
+                    position_ids=position_ids,
                     past_key_values=None,
                     temperature=args.temperature,
                     top_k=args.top_k,
@@ -126,17 +144,32 @@ def main(args: argparse.Namespace):
                 )
 
                 # Generation Phase
+                seq_length = attention_mask.sum(dim=-1)
                 trajectories = [[] for _ in range(B)]
-                for _ in range((args.max_new_seq_len + args.n_token_seq_len - 1) // args.n_token_seq_len):
+                for i_block in range((args.max_new_seq_len + args.n_token_seq_len - 1) // args.n_token_seq_len):
                     active_idx = [
                         i for i, traj in enumerate(trajectories)
                         if (not traj) or (not (traj[-1][-1] == tokenizer.eos_token_id).any())
                     ]
 
+                    if not active_idx:
+                        break
+
                     q_sampled = torch.randint(0, tokenizer.vocab_size, (B, args.n_token_seq_len-1), device=model.device)
+
+                    input_ids = torch.cat((next_token, q_sampled), dim=-1)
+                    position_ids = torch.arange(args.n_token_seq_len, device=model.device).unsqueeze(0) + seq_length.unsqueeze(1)
+                    position_ids += i_block * args.n_token_seq_len
+
+                    attention_mask = torch.cat((
+                        attention_mask,
+                        torch.ones(B, args.n_token_seq_len, device=attention_mask.device, dtype=attention_mask.dtype)
+                    ), dim=-1)
+
                     past_key_values, next_token, trajectory = model.forward_jacobi(
-                        input_ids=torch.cat((next_token, q_sampled),dim=-1),
-                        attention_mask=None,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
                         past_key_values=past_key_values,
                         temperature=args.temperature,
                         top_k=args.top_k,
@@ -162,7 +195,7 @@ def main(args: argparse.Namespace):
                 }, schema=schema))
         except Exception as e:
             console.print("[red]Generation interrupted. Saving progress...[/red]")
-            console.print(f"[red]Error: {e}[/red]")
+            raise e
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -170,8 +203,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", type=Path, default='output.parquet', help="Path to output Parquet file.")
     parser.add_argument("--n_token_seq_len", type=int, default=64)
     parser.add_argument("--max_new_seq_len", type=int, default=8192)
-    parser.add_argument("--max_prompt_len", type=int, default=8192)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
