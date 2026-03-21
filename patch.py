@@ -17,13 +17,14 @@ def _clone_layer(layer):
     new.is_initialized = True
     return new
 
-def select_batch(cache: Cache, indices: List[int]) -> DynamicCache:
+def select_batch(cache: Cache, indices, n_rewind: int = 0) -> DynamicCache:
+    selector = ... if n_rewind <= 0 else slice(0, -n_rewind)
     new_cache = DynamicCache()
     idx = torch.tensor(indices, device=cache.layers[0].keys.device)
     for layer in cache.layers:
         new_layer = _clone_layer(layer)
-        new_layer.keys = layer.keys.index_select(0, idx)
-        new_layer.values = layer.values.index_select(0, idx)
+        new_layer.keys = layer.keys[:, :, selector].index_select(0, idx)
+        new_layer.values = layer.values[:, :, selector].index_select(0, idx)
         new_cache.layers.append(new_layer)
     return new_cache
 
@@ -33,17 +34,17 @@ def merge_batch(dst: Cache, src: Cache, indices: List[int]):
     idx = torch.tensor(indices, device=src.layers[0].keys.device)
     for dl, sl in zip(dst.layers, src.layers):
         src_seq = sl.keys.shape[2]
-        dl.keys[idx, :, :src_seq, :] = sl.keys.clone()
-        dl.values[idx, :, :src_seq, :] = sl.values.clone()
+        dl.keys[idx, :, :src_seq, :] = sl.keys
+        dl.values[idx, :, :src_seq, :] = sl.values
 
 def empty_like(cache: Cache, extra_seq: int) -> DynamicCache:
     new_cache = DynamicCache()
     for layer in cache.layers:
         B, H, S, D = layer.keys.shape
         new_layer = _clone_layer(layer)
-        new_layer.keys = torch.zeros(B, H, S + extra_seq, D,
+        new_layer.keys = torch.empty(B, H, S + extra_seq, D,
                                      dtype=layer.keys.dtype, device=layer.keys.device)
-        new_layer.values = torch.zeros(B, H, S + extra_seq, D,
+        new_layer.values = torch.empty(B, H, S + extra_seq, D,
                                        dtype=layer.values.dtype, device=layer.values.device)
         new_cache.layers.append(new_layer)
     return new_cache
@@ -169,18 +170,11 @@ def forward_jacobi(
                 position_embeddings=position_embeddings,
             )
 
-        hidden_states = self.model.norm(hidden_states)
-        logits = self.lm_head(hidden_states).float()
-        last_probs = _build_probs_from_logits(logits[:, -1, :], temperature, top_k, top_p)
-        next_token = _select_tokens(last_probs, do_sample).unsqueeze(-1)
-
-        return past_key_values, next_token
+        return past_key_values
 
     # Stage2: Generation
     B, L = input_ids.shape
     assert past_key_values.layers
-
-    device = input_ids.device
 
     # out: [B, L]
     #   Initially:
@@ -197,19 +191,20 @@ def forward_jacobi(
     #      ...                 └─ [1, n_accepted]
     #   ]
     out = input_ids.clone()
+    device = input_ids.device
 
     total_accepted = torch.zeros(B, dtype=torch.long, device=device)
     unfinished_mask = torch.ones(B, dtype=torch.bool, device=device)
 
     next_tokens = torch.zeros(B, 1, dtype=input_ids.dtype, device=device)
-    past_kv_fin = empty_like(past_key_values, extra_seq=L)
+    past_kv_fin = empty_like(past_key_values, extra_seq=L-1)
 
-    trajectory = [[] for _ in range(B)]
+    trajectory = [[ input_ids[i, 1:].clone() ] for i in range(B)]
     while True:
         # Select unfinished samples
         idx_unfin = unfinished_mask.nonzero(as_tuple=False).squeeze(1)
         out_unfin = out[idx_unfin]
-        past_kv_unfin = select_batch(past_key_values, idx_unfin.tolist())
+        past_kv_unfin = select_batch(past_key_values, idx_unfin)
 
         # Forward pass
         inputs_embeds = self.model.embed_tokens(out_unfin[:, -L:])
@@ -262,6 +257,7 @@ def forward_jacobi(
             anchor_idx = total_accepted[orig_idx].item()
             p_logits = logits[n:n+1, anchor_idx:, :]
             p_prob = _build_probs_from_logits(p_logits, temperature, top_k, top_p)
+
             draft_tokens = out_unfin[n:n+1, anchor_idx+1:] # skip first input token (anchor)
             target_tokens = _select_tokens(p_prob[:, :-1, :], do_sample) # skip last token (next token)
 
@@ -273,7 +269,6 @@ def forward_jacobi(
             next_token = _select_tokens(
                 p_prob[:, n_matched, :], do_sample
             ).unsqueeze(-1)[0]
-            next_tokens[orig_idx] = next_token
 
             # If draft is not fully accepted
             if total_accepted[orig_idx] < L:
@@ -287,15 +282,17 @@ def forward_jacobi(
                     next_token, # next token becomes new anchor
                     new_draft, # draft tokens
                 ])
+
+                next_tokens[orig_idx] = next_token
+                trajectory[orig_idx].append(out[orig_idx, 1:].clone())
             else:
                 # Save final KV cache
-                merge_batch(
-                    past_kv_fin,
-                    select_batch(past_kv_unfin, [n]),
-                    [orig_idx]
-                )
-
-            trajectory[orig_idx].append(out[orig_idx].clone())
+                for dl, sl in zip(past_kv_fin.layers, past_kv_unfin.layers):
+                    src_keys = sl.keys[n:n+1, :, :-1, :]
+                    src_values = sl.values[n:n+1, :, :-1, :]
+                    src_seq = src_keys.shape[2]
+                    dl.keys[orig_idx:orig_idx+1, :, :src_seq, :] = src_keys
+                    dl.values[orig_idx:orig_idx+1, :, :src_seq, :] = src_values
 
         unfinished_mask = total_accepted < L
         if not unfinished_mask.any():
