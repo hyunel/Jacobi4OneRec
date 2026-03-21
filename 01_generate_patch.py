@@ -66,7 +66,6 @@ def load_data(dataset_paths, batch_size):
             **x,
             "messages": convert_messages(json.loads(x["messages"])[:-1])
         })
-        .batch(batch_size)
         .shuffle(seed=42)
     )
 
@@ -88,14 +87,43 @@ def main(args: argparse.Namespace):
         'max_new_seq_len': str(args.max_new_seq_len),
     })
 
-    dataset = load_data(args.dataset, args.batch_size)
+    def _tokenize(x):
+        prompts = tokenizer.apply_chat_template(
+            x['messages'],
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        model_inputs = tokenizer(
+            prompts,
+            padding=False,
+            truncation=True,
+        )
+
+        return {
+            **x,
+            "input_ids": model_inputs["input_ids"]
+        }
+
+    def _filter(x):
+        if len(x['input_ids']) <= args.max_prompt_len:
+            return True
+        console.print(f"[yellow]Skipping sample with UUID {x['uuid']} due to prompt length {len(x['input_ids'])} exceeding max_prompt_len {args.max_prompt_len}[/yellow]")
+        return False
+
+    dataset = (load_data(args.dataset, args.batch_size)
+        .map(_tokenize)
+        .filter(_filter)
+        .batch(args.batch_size)
+    )
+
     progress = Progress(console=console)
+    max_blocks = (args.max_new_seq_len + args.n_token_seq_len - 1) // args.n_token_seq_len
     with pq.ParquetWriter(args.output, schema) as writer, progress:
-        task = progress.add_task("Generating...", total=None)
+        task = progress.add_task("Generating batches...", total=None)
+        block_task = progress.add_task("Current batch blocks", total=max_blocks, visible=False)
         try:
             for batch in dataset:
-                if not any(u == '91b35870-a4ec-11f0-8f4b-946daee91278' for u in batch['uuid']):
-                    continue
                 for i in range(len(batch['uuid'])):
                     console.print(f"[dim] Messages: {batch['messages'][i]}[/dim]")
 
@@ -118,17 +146,6 @@ def main(args: argparse.Namespace):
 
                 B, _ = input_ids.shape
 
-                # input_ids = model_inputs["input_ids"]
-                # print('Input IDs length:', len(input_ids[0]))
-                # while True:
-                #     out = model(input_ids)
-                #     next_token = torch.argmax(out.logits[:, -1, :], dim=-1)
-                #     input_ids = torch.cat((input_ids, next_token.unsqueeze(-1)), dim=-1)
-                #     print(tokenizer.decode(next_token[0].item(), skip_special_tokens=False), end="")
-                #     if (next_token == tokenizer.eos_token_id).any():
-                #         break
-                # continue
-
                 # Prefill Phase
                 position_ids = attention_mask.long().cumsum(-1) - 1
                 position_ids = position_ids.masked_fill(attention_mask == 0, 0)
@@ -145,7 +162,14 @@ def main(args: argparse.Namespace):
                 # Generation Phase
                 seq_length = attention_mask.sum(dim=-1)
                 trajectories = [[] for _ in range(B)]
-                for i_block in range((args.max_new_seq_len + args.n_token_seq_len - 1) // args.n_token_seq_len):
+                progress.update(
+                    block_task,
+                    completed=0,
+                    total=max_blocks,
+                    description=f"Current batch blocks (0/{max_blocks})",
+                    visible=True,
+                )
+                for i_block in range(max_blocks):
                     active_idx = [
                         i for i, traj in enumerate(trajectories)
                         if (not traj) or (not (traj[-1][-1] == tokenizer.eos_token_id).any())
@@ -180,6 +204,14 @@ def main(args: argparse.Namespace):
                         decoded = tokenizer.decode(trajectory[i][-1], skip_special_tokens=False)
                         console.print(f"[dim][Sample {i}][/dim] {decoded}")
 
+                    progress.update(
+                        block_task,
+                        completed=i_block + 1,
+                        description=f"Current batch blocks ({i_block + 1}/{max_blocks})",
+                    )
+
+                progress.update(block_task, visible=False)
+
                 # Write batch to parquet
                 masks = model_inputs["attention_mask"].bool()
                 writer.write_table(pa.table({
@@ -199,13 +231,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=Path, action="append", help="Path(s) to input dataset(s) in Parquet format.")
     parser.add_argument("--output", "-o", type=Path, default='output.parquet', help="Path to output Parquet file.")
-    parser.add_argument("--n_token_seq_len", type=int, default=64)
-    parser.add_argument("--max_new_seq_len", type=int, default=8192)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--n_token_seq_len", type=int, default=32)
+    parser.add_argument("--max_new_seq_len", type=int, default=32 * 32)
+    parser.add_argument("--max_prompt_len", type=int, default=4096)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--temperature", type=float, default=0)
-    parser.add_argument("--top_k", type=int, default=0)
-    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--temperature", type=float, default=0.75)
+    parser.add_argument("--top_k", type=int, default=20)
+    parser.add_argument("--top_p", type=float, default=0.95)
     args = parser.parse_args()
 
     main(args)

@@ -60,7 +60,11 @@ class Scheduler:
                 if not (hasattr(seq, 'decode_strategy') and seq.decode_strategy == "jacobi"):
                     self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        # Old behavior crashed here when all running sequences were preempted due to
+        # temporary block pressure in Jacobi decoding.
+        # assert scheduled_seqs
+        if not scheduled_seqs:
+            return [], False
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 

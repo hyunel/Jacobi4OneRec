@@ -1,5 +1,0 @@
-datasets
-torch
-pyarrow
-transformers
-rich

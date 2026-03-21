@@ -1,5 +1,11 @@
-model/
 *.parquet
 *.safetensors
 *.pt
 *.bin
+__pycache__/
+logs/
+data/
+wandb/
+outputs/
+.venv/
+.vscode/

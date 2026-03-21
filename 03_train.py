@@ -6,15 +6,13 @@ from typing import Dict, Optional, List
 import os
 import sys
 import torch
-from torch.utils.data import Dataset, DataLoader  # ### CHANGED
+from torch.utils.data import Dataset
 import transformers
 from transformers.trainer_pt_utils import LabelSmoother
 import logging
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from datasets import load_dataset
-from transformers.integrations import HfDeepSpeedConfig
-from accelerate import Accelerator, DeepSpeedPlugin
-from .trainer import CllmTrainer
+from trainer import CllmTrainer
 
 logger = logging.getLogger(__name__)
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
@@ -63,7 +61,7 @@ def rank0_print(local_rank, *args):
     if local_rank in (0, -1):
         print(*args)
 
-def safe_save_model_for_hf_trainer(model, tokenizer, output_dir, accelerator=None):  # ### CHANGED
+def safe_save_model_for_hf_trainer(model, tokenizer, output_dir, accelerator=None):
     """
     Save weights. Works with Accelerator/DeepSpeed:
     - If accelerator provided, unwrap first.
@@ -74,7 +72,6 @@ def safe_save_model_for_hf_trainer(model, tokenizer, output_dir, accelerator=Non
     to_save = model
     if accelerator is not None:
         to_save = accelerator.unwrap_model(model)
-    # Some DS engines expose .module; unwrap again if needed
     if hasattr(to_save, "module"):
         to_save = to_save.module
     to_save.save_pretrained(output_dir, safe_serialization=False)
@@ -138,27 +135,15 @@ def train():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
     training_args.local_rank = local_rank
-
     training_args.qlora = model_args.qlora
-
-    training_args.deepspeed = training_args.deepspeed or "scripts/ds_config_cpu_offloading.json"
-
-    # Accelerate + DeepSpeed plugin
-    ds_plugin = DeepSpeedPlugin(hf_ds_config=training_args.deepspeed)  # path or dict
-    accelerator = Accelerator(
-        gradient_accumulation_steps=training_args.gradient_accumulation_steps or 1,
-        mixed_precision="bf16" if training_args.bf16 else ("fp16" if training_args.fp16 else "no"),
-        log_with=training_args.report_to if training_args.report_to else None,
-        deepspeed_plugin=ds_plugin,
-    )
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
-        level=logging.INFO if accelerator.is_local_main_process else logging.ERROR,  # ### ADDED
+        level=logging.INFO if local_rank in (0, -1) else logging.ERROR,
     )
-    if accelerator.is_local_main_process:
+    if local_rank in (0, -1):
         transformers.utils.logging.set_verbosity_info()
     else:
         transformers.utils.logging.set_verbosity_error()
@@ -179,9 +164,6 @@ def train():
             f"model_max_length ({training_args.model_max_length}) > orig_ctx_len ({orig_ctx_len})"
         )
     config.use_cache = False
-
-    # partitioned loading for ZeRO-3/offload
-    dschf = HfDeepSpeedConfig(training_args.deepspeed)
 
     # Model + Tokenizer
     attn_impl = "flex_attention"
@@ -208,7 +190,7 @@ def train():
 
     # Data Prep
     trajectory_dataset = load_dataset(
-        "json", data_files={"train": data_args.data_path}, split="train", cache_dir=training_args.cache_dir
+        "parquet", data_files={"train": data_args.data_path}, split="train", cache_dir=training_args.cache_dir
     )
     data_module = make_jacobian_data_module(
         tokenizer=tokenizer,
@@ -218,46 +200,12 @@ def train():
         local_rank=training_args.local_rank,
     )
 
-    # Build DataLoader here so we can pass it through accelerator.prepare
-    per_device_bs = training_args.per_device_train_batch_size or 1  # from TrainingArguments
-    train_dataloader = DataLoader(
-        data_module["train_dataset"],
-        batch_size=per_device_bs,
-        shuffle=False,
-        num_workers=training_args.dataloader_num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-    # Optimizer
-    # Filter trainable params
-    params = (p for p in model.parameters() if p.requires_grad)
-
-    optimizer = torch.optim.AdamW(params, lr=training_args.learning_rate, betas=(0.9, 0.95), eps=1e-8)
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / (training_args.gradient_accumulation_steps or 1))
-    max_train_steps = int(training_args.num_train_epochs * num_update_steps_per_epoch)
-    lr_scheduler = transformers.get_scheduler(
-        name=training_args.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=training_args.get_warmup_steps(max_train_steps),
-        num_training_steps=max_train_steps,
-    )
-
-    # Accelerate + DeepSpeed wrapper
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
-    )
-
     # trainer
     trainer = CllmTrainer(
         model=model,
-        tokenizer=tokenizer,
         args=training_args,
         train_dataset=data_module["train_dataset"],
-        accelerator=accelerator,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
-        train_dataloader=train_dataloader
+        tokenizer=tokenizer,
     )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
@@ -265,10 +213,9 @@ def train():
     else:
         trainer.train()
 
-    if accelerator.is_main_process:
-        safe_save_model_for_hf_trainer(model=model, tokenizer=tokenizer,
-                                       output_dir=training_args.output_dir,
-                                       accelerator=accelerator)
+    trainer.save_model(training_args.output_dir)
+    if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(training_args.output_dir)
 
 if __name__ == "__main__":
     train()

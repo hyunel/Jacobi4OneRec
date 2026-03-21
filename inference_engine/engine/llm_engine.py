@@ -85,6 +85,8 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        if not seqs:
+            return [], 0
         result = self.model_runner.call("run", seqs, is_prefill)
         
         if result is None or (is_prefill and len(result) > 0 and result[0] == []):
@@ -106,6 +108,11 @@ class LLMEngine:
             for seq in seqs:
                 seq.status = seq.status.__class__.FINISHED
                 seq._rollout_records = rollout_records
+                # Old behavior only removed finished on-policy sequences from the
+                # running queue, which leaked their KV blocks over time.
+                # if seq in self.scheduler.running:
+                #     self.scheduler.running.remove(seq)
+                self.scheduler.block_manager.deallocate(seq)
                 if seq in self.scheduler.running:
                     self.scheduler.running.remove(seq)
             

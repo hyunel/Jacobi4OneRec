@@ -31,7 +31,6 @@ class Sequence:
         # flags for decode path
         self.decode_strategy = sampling_params.decode_strategy
         self.jacobi_block_len = sampling_params.jacobi_block_len
-        self.jacobi_max_blocks = sampling_params.jacobi_max_blocks
         self.jacobi_spawn_ratio = sampling_params.jacobi_spawn_ratio
         self.jacobi_lookahead_start_ratio = sampling_params.jacobi_lookahead_start_ratio
         self.jacobi_n_gram_pool_size = sampling_params.jacobi_n_gram_pool_size

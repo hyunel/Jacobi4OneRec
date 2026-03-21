@@ -7,18 +7,20 @@ class SamplingParams:
     max_tokens: int = 64
     ignore_eos: bool = False
 
+    top_k: int = -1
+    top_p: float = 1.0
+
     # Decode strategy: "autoregressive" [supported], "jacobi" [supported], "jacobi_multiblock_rejection_recycling" [not supported]
     decode_strategy: str = "autoregressive"
 
     jacobi_block_len: int = 64          # n_token_seq_len in your code
     jacobi_max_iterations: int = 128
-    
+
     # Jacobi multi-block params
-    jacobi_max_blocks: int = 2           # K
     jacobi_spawn_ratio: float = 0.85     # r
     jacobi_lookahead_start_ratio: float = 0.0
     jacobi_n_gram_pool_size: int = 4
-    
+
     # On-policy learning: if True, returns rollout records instead of tokens
     # Requires non-greedy decoding (temperature > 0) and decode_strategy == "jacobi"
     jacobi_on_policy: bool = False

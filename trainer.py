@@ -8,14 +8,11 @@ from torch.nn.attention.flex_attention import create_block_mask
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 class CllmTrainer(Trainer):
-    def __init__(self, *args,  accelerator=None, optimizer=None, lr_scheduler=None, train_dataloader=None, **kwargs):
+    def __init__(self, tokenizer, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        args = kwargs["args"]
 
-        self.accelerator = accelerator
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
-        self.train_dataloader = train_dataloader
+        self.tokenizer = tokenizer
+        args = kwargs["args"]
 
         self.base_model = self.accelerator.unwrap_model(self.model)
         self.cfg = self.base_model.config
@@ -96,7 +93,7 @@ class CllmTrainer(Trainer):
         Combines: (a) PAD tokens, (b) duplicate-prefix in each k_j vs last_j.
         """
         device = input_ids.device
-        pad_id = getattr(self.processing_class, "pad_token_id", None)
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
 
         mask = torch.zeros_like(input_ids, dtype=torch.bool, device=device)
         if pad_id is not None:
@@ -279,8 +276,8 @@ class CllmTrainer(Trainer):
         input_ids, prompt_len, T = self._unpack_sample(inputs)
         L = input_ids.size(0)
 
-        eos_id = getattr(self.processing_class, "eos_token_id")
-        pad_id = getattr(self.processing_class, "pad_token_id")
+        eos_id = getattr(self.tokenizer, "eos_token_id")
+        pad_id = getattr(self.tokenizer, "pad_token_id")
         N = self.max_new_tokens
 
         expected_len = prompt_len + 2 * T * N
@@ -298,7 +295,7 @@ class CllmTrainer(Trainer):
         #print("\n=== AR INPUTS (prompt + concatenated l_j blocks) ===")
 
         # Decode
-        #ar_text = self.processing_class.decode(ar_concat_ids, skip_special_tokens=False)
+        #ar_text = self.tokenizer.decode(ar_concat_ids, skip_special_tokens=False)
 
         #print("\n[Decoded text]")
         #print(ar_text)
@@ -307,7 +304,7 @@ class CllmTrainer(Trainer):
         #print("\n=== k_j BLOCKS ===")
         #for j, ks in enumerate(k_starts):
         #    block_ids = input_ids[ks : ks + N]
-        #    block_text = self.processing_class.decode(block_ids, skip_special_tokens=False)
+        #    block_text = self.tokenizer.decode(block_ids, skip_special_tokens=False)
         #    print(f"[k_{j}]")
         #    print(block_text)
         #    print()
@@ -451,12 +448,12 @@ class CllmTrainer(Trainer):
             p_all = torch.cat(pair_logit_positions, dim=0)
             t_all = torch.cat(pair_target_positions, dim=0)
 
-            ar_logits  = logits[0, p_all, :].clone()                          # [K, V]
-            ar_targets = input_ids.index_select(0, t_all).clone().detach()    # [K]
+            ar_logits  = logits[0, p_all, :]                                  # [K, V]
+            ar_targets = input_ids.index_select(0, t_all).detach()            # [K]
 
             # ===== DEBUG PRINTING ===== #
             if self.args.local_rank == 0:
-                print(f"===== decoded last_N AR targets =====\n{self.processing_class.decode(ar_targets[-64:])}\n==========\n")
+                print(f"===== decoded last_N AR targets =====\n{self.tokenizer.decode(ar_targets[-64:])}\n==========\n")
                 print(f"===== last_N AR tokens =====\n{ar_targets[-64:]}\n==========\n")
             # ===== DEBUG PRINTING ===== #
 

@@ -19,9 +19,9 @@ class Config:
     num_kvcache_blocks: int = -1
 
     jacobi_enabled: bool = True
-    
+
     jacobi_block_len: int = 64
-    jacobi_max_blocks: int = 2
+    jacobi_max_block_len: int = 65
     jacobi_spawn_ratio: float = 0.8
     jacobi_lookahead_start_ratio: float = 0.0
     jacobi_n_gram_pool_size: int = 4

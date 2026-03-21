@@ -1186,9 +1186,19 @@ class ModelRunner:
                     if debug:
                         print(f"    [BLOCK_ALLOC] seq_{i}: Allocating {blocks_to_allocate} new blocks (no-clear)")
                     
+                    # Old logic checked can_append(seq) per iteration, which only reflects
+                    # single-token append semantics and can pass even when the deque does not
+                    # have enough blocks for the whole speculative allocation.
+                    # for _ in range(blocks_to_allocate):
+                    #     if not self.block_manager.can_append(seq):
+                    #         raise RuntimeError("Cannot allocate blocks for draft tokens")
+                    if len(self.block_manager.free_block_ids) < blocks_to_allocate:
+                        raise RuntimeError(
+                            f"Cannot allocate blocks for draft tokens: need {blocks_to_allocate}, "
+                            f"have {len(self.block_manager.free_block_ids)}"
+                        )
+
                     for _ in range(blocks_to_allocate):
-                        if not self.block_manager.can_append(seq):
-                            raise RuntimeError("Cannot allocate blocks for draft tokens")
                         block_id = self.block_manager.free_block_ids[0]
                         
                         block = self.block_manager._allocate_block_no_clear(block_id)

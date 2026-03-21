@@ -1,21 +1,23 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0
 export WANDB_PROJECT=cllm2_training
 
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256"
 
-model_path="data/models/progressive_noise_cllm2_mask_1m_steps"
+model_path="model/OneRec-1.7B"
 #trajectory_file="data/data/CLLM2_openthought/merged/merged_data_v2_8_27_opencodeinstruct.jsonl"
-trajectory_file="data/data/cllm2_packed_data/merged-traj-data-oct-16-n32w16.jsonl"
-output_path="data/ckpts/v2/shiftedattn-11-19-cllm-qwen2p5-coder-7B-n16w16-n32w16_distill_data_v2_ar_1_only_cyclic_progressive_noise_all_lr1e-5"
-n_token_seq_size=32
+# trajectory_file="data/data/cllm2_packed_data/merged-traj-data-oct-16-n32w16.jsonl"
+deepspeed_config_file="train_deepspeed.json"
+trajectory_file="outputs/fixed_windowed/*.parquet"
+output_path="outputs/OneRec-1.7B-n64w8"
+n_token_seq_size=64
 qlora=False
 
-torchrun --nnodes=1 --nproc_per_node=4 --rdzv_id=101 \
+torchrun --nnodes=1 --nproc_per_node=1 --rdzv_id=101 \
     --rdzv_endpoint='localhost:5666' \
     --master_port 10000 \
-    train/soft_flexattn_train_cllm_multiblock.py \
+    03_train.py \
     --target_model_path ${model_path} \
-    --data_path ${trajectory_file} \
+    --data_path "${trajectory_file}" \
     --output_dir ${output_path} \
     --max_new_tokens ${n_token_seq_size} \
     --bf16 True \

@@ -4,13 +4,11 @@ from typing import Optional, Dict, Any, Tuple, List
 from tqdm import tqdm
 from datasets import load_dataset
 import numpy as np
+import pandas as pd
 
-# -----------------------
-# Args
-# -----------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Low-RAM parallel preprocessing for efficient CLLM training JSONL."
+        description="Low-RAM parallel preprocessing for efficient CLLM training parquet."
     )
     parser.add_argument("--input_path", required=True)
     parser.add_argument("--output_path", required=True)
@@ -20,63 +18,26 @@ def parse_args():
     parser.add_argument("--n_token_seq_length", type=int, required=True)
     parser.add_argument("--strategy", required=True)
     parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=max(os.cpu_count(), 1))
     parser.add_argument("--max-in-flight", type=int, default=None)
     parser.add_argument("--db-path", default=None)
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--single-process", action="store_true")
-    # in parse_args()
 
     return parser.parse_args()
 
-# -----------------------
-# Deterministic RNG
-# -----------------------
-def stable_seed(*parts: Any, base_seed: int = 0) -> int:
-    h = hashlib.sha256()
-    for p in parts:
-        h.update(str(p).encode("utf-8")); h.update(b"|")
-    h.update(base_seed.to_bytes(8, "little", signed=False))
-    return int.from_bytes(h.digest()[:8], "big", signed=False)
-
-# -----------------------
-# ID parsing helpers
-# -----------------------
 def parse_data_id_int(data_id: str) -> int:
-    """Extract the integer from 'data_{id}' robustly."""
-    if data_id.startswith("data_"):
-        return int(data_id[5:])
-    m = re.search(r"(\d+)", data_id)
-    return int(m.group(1)) if m else 0
+    digest = hashlib.blake2b(data_id.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big") & ((1 << 63) - 1)
 
 def parse_itr_int(itr_id: str) -> int:
-    """Extract the integer from 'itr_{iteration_id}' robustly."""
     if itr_id.startswith("itr_"):
         return int(itr_id[4:])
     m = re.search(r"(\d+)", itr_id)
     return int(m.group(1)) if m else 0
 
-# -----------------------
-# Per-sample transform
-# -----------------------
-def parse_itr_int(itr_id: str) -> int:
-    """
-    Extracts the integer that follows 'itr_' using regex.
-    Examples:
-      'itr_0'   -> 0
-      'itr_17' -> 17
-    Falls back to 0 if no match.
-    """
-    m = re.search(r"itr_(\d+)", itr_id)
-    return int(m.group(1)) if m else 0
-
 def find_first_non_equal(seq1: list, seq2: list) -> int:
-    """
-    Returns the index of the first differing element from the left between seq1 and seq2.
-    If the sequences are identical, returns the length of seq1.
-    """
     arr1 = np.array(seq1)
     arr2 = np.array(seq2)
     diff = arr1 != arr2
@@ -86,7 +47,6 @@ def find_first_non_equal(seq1: list, seq2: list) -> int:
 def process_one_sample(
     sample: Dict[str, Any],
     n_token_seq_length: int,
-    base_seed: int,     # kept for signature compatibility; unused
     window_size: int,
     min_noisy_ratio: float,
     max_noisy_ratio: float,
@@ -194,13 +154,12 @@ def main():
 
     # Streaming dataset
     data = load_dataset(
-        "json",
+        "parquet",
         data_files={"train": args.input_path},
         split="train",
         streaming=True,
         cache_dir=args.cache_dir
     )
-    length = sum(1 for _ in data)
 
     # SQLite store
     db_path = args.db_path or tempfile.mkstemp(
@@ -224,14 +183,14 @@ def main():
     try:
         if args.single_process or args.num_workers <= 1:
             for sample in data:
-                handle(process_one_sample(sample, args.n_token_seq_length, args.seed, args.window_size, args.min_noisy_ratio, args.max_noisy_ratio, args.strategy))
+                handle(process_one_sample(sample, args.n_token_seq_length, args.window_size, args.min_noisy_ratio, args.max_noisy_ratio, args.strategy))
             conn.commit()
         else:
             in_flight = set()
             with ProcessPoolExecutor(max_workers=args.num_workers) as ex:
                 for i, sample in enumerate(data):
                     in_flight.add(ex.submit(
-                        process_one_sample, sample, args.n_token_seq_length, args.seed, args.window_size, args.min_noisy_ratio, args.max_noisy_ratio, args.strategy))
+                        process_one_sample, sample, args.n_token_seq_length, args.window_size, args.min_noisy_ratio, args.max_noisy_ratio, args.strategy))
                     if len(in_flight) >= max_in_flight:
                         done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
                         for fut in done: handle(fut.result())
@@ -241,36 +200,35 @@ def main():
         pbar.close()
 
     # -------- Final write-out with sorting --------
-    with open(args.output_path, "w", encoding="utf-8") as fout:
-        cur = cur = conn.execute("SELECT value FROM entries ORDER BY data_id_int")
-        count = 0
+    cur = conn.execute("SELECT value FROM entries ORDER BY data_id_int")
+    rows = []
 
-        # across all data_id
-        for (value_str,) in cur:
-            entry = json.loads(value_str)
+    # across all data_id
+    for (value_str,) in cur:
+        entry = json.loads(value_str)
 
-            # Sort the (k_j,last_j) pairs by diffusion_itr (int)
-            pairs_sorted = sorted(entry["pairs"], key=lambda p: p["diffusion_itr"])
+        # Sort the (k_j,last_j) pairs by diffusion_itr (int)
+        pairs_sorted = sorted(entry["pairs"], key=lambda p: p["diffusion_itr"])
 
-            # Flatten sequences
-            concatenated_pairs: List[int] = list(
-                itertools.chain.from_iterable(p["seq"] for p in pairs_sorted)
-            )
+        # Flatten sequences
+        concatenated_pairs: List[int] = list(
+            itertools.chain.from_iterable(p["seq"] for p in pairs_sorted)
+        )
 
-            traj_position_indices: List[int] = list(
-                p["traj_position_index"] for p in pairs_sorted
-            )
+        traj_position_indices: List[int] = list(
+            p["traj_position_index"] for p in pairs_sorted
+        )
 
-            output_entry = dict(
-                data_id               = entry["data_id"],
-                prompt_ids            = entry["prompt_ids"][0],
-                complete_training_sequence_ids = entry["prompt_ids"][0] + concatenated_pairs,
-                prompt_ids_len = len(entry["prompt_ids"][0]),
-                traj_position_indices = traj_position_indices,
-            )
-            fout.write(json.dumps(output_entry, ensure_ascii=False))
-            fout.write("\n")
-            count += 1
+        rows.append(dict(
+            data_id=entry["data_id"],
+            prompt_ids=entry["prompt_ids"],
+            complete_training_sequence_ids=entry["prompt_ids"] + concatenated_pairs,
+            prompt_ids_len=len(entry["prompt_ids"]),
+            traj_position_indices=traj_position_indices,
+        ))
+
+    pd.DataFrame(rows).to_parquet(args.output_path, index=False)
+    count = len(rows)
 
     # Remove temp DB if we created it
     if not args.db_path:
