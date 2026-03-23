@@ -38,6 +38,7 @@ class JacobiTrainer(Trainer):
         self.distill_temperature = distill_temperature
         self.ar_loss_weight = ar_loss_weight
 
+        self._custom_metrics = {}
         self.create_block_mask = torch.compile(create_block_mask)
 
     def _create_mask(
@@ -132,11 +133,23 @@ class JacobiTrainer(Trainer):
 
         loss = loss_ar * self.ar_loss_weight + loss_consistency
 
+        self._custom_metrics = {
+            "loss_ar": loss_ar.detach().item(),
+            "loss_consistency": loss_consistency.detach().item(),
+        }
+
         return (loss, outputs) if return_outputs else loss
 
+    def log(self, logs, *args, **kwargs):
+        if "loss" in logs:
+            logs.update(self._custom_metrics)
+        return super().log(logs, *args, **kwargs)
+
+
 class JacobiDataCollator:
-    def __init__(self, n_token_seq_len):
+    def __init__(self, n_token_seq_len, max_blocks=None):
         self.n_token_seq_len = n_token_seq_len
+        self.max_blocks = max_blocks
 
     @staticmethod
     def _write_chunk(dst_ids, i_row, i_start, seq):
@@ -155,7 +168,7 @@ class JacobiDataCollator:
 
         B = len(features)
 
-        n_blocks = [len(feature["blocks"]) for feature in features]
+        n_blocks = [len(feature["blocks"][:self.max_blocks]) for feature in features]
         max_n_blocks = max(n_blocks)
         max_n_prompt = max(len(feature["prompt_ids"]) for feature in features)
 
@@ -167,8 +180,8 @@ class JacobiDataCollator:
 
         for i_row, feature in enumerate(features):
             prompt_ids = feature["prompt_ids"]
-            blocks = feature["blocks"]
-            answers = feature["answers"]
+            blocks = feature["blocks"][:self.max_blocks]
+            answers = feature["answers"][:self.max_blocks]
 
             n_prompt = len(prompt_ids)
             n_pad = max_n_prompt - n_prompt
@@ -199,10 +212,7 @@ class JacobiDataCollator:
 
 def main(args: Arguments):
     # Load the dataset
-    dataset = load_dataset("parquet", data_files=args.data_path, split="train").map(lambda x: {
-        **x,
-        "blocks": [ block for block in x["blocks"][:args.max_blocks] ],
-    })
+    dataset = load_dataset("parquet", data_files=args.data_path, split="train")
 
     # Load the model+tokenizer
     model = AutoModelForCausalLM.from_pretrained(
@@ -225,14 +235,15 @@ def main(args: Arguments):
         model = peft.get_peft_model(model, lora_config)
 
     # Trainer
-    n_token_seq_len = len(dataset[0]["blocks"][0])
+    n_token_seq_len = len(next(iter(dataset))["blocks"][0])
     trainer = JacobiTrainer(
         model=model,
         tokenizer=tokenizer,
         args=args,
         train_dataset=dataset,
         data_collator=JacobiDataCollator(
-            n_token_seq_len=n_token_seq_len
+            n_token_seq_len=n_token_seq_len,
+            max_blocks=args.max_blocks,
         ),
         n_token_seq_len=n_token_seq_len,
     )
