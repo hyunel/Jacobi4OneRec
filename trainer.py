@@ -8,21 +8,23 @@ from torch.nn.attention.flex_attention import create_block_mask
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 class CllmTrainer(Trainer):
-    def __init__(self, tokenizer, *args, **kwargs):
+    def __init__(
+        self,
+        tokenizer,
+        *args,
+        **kwargs
+    ):
         super().__init__(*args, **kwargs)
 
         self.tokenizer = tokenizer
         args = kwargs["args"]
 
-        self.base_model = self.accelerator.unwrap_model(self.model)
-        self.cfg = self.base_model.config
+        self.cfg = self.accelerator.unwrap_model(self.model).config
 
         self.train_step_cnt = 0
 
         self.max_new_tokens = args.max_new_tokens
-        self.use_gt_labels = args.use_gt_labels
-        # cache BlockMasks keyed by (L, prompt_len, T, heads, version)
-        self._blockmask_cache = {}
+
 
     # Utilities
     @staticmethod
@@ -315,21 +317,6 @@ class CllmTrainer(Trainer):
 
         ### METHOD 1: PAD post-EOS TOKENS on last_N
         self._flip_block_after_eos_to_pad(input_ids, l_starts[-1], N, eos_id, pad_id)
-
-        ###-- METHOD 2: cut post-EOS inside k_N & last_N block
-        #--for j in range(T):
-        #--    starting_pos_k = k_starts[j]
-        #--    starting_pos_l = l_starts[j]
-
-        #--    block_k = input_ids[starting_pos_k : starting_pos_k + N]
-        #--    block_l = input_ids[starting_pos_l : starting_pos_l + N]
-
-        #--    pos = (block_l == eos_id).nonzero(as_tuple=False)
-        #--    if pos.numel():
-        #--        first_eos_pos_k = starting_pos_k + int(pos[0])
-        #--        first_eos_pos_l = starting_pos_l + int(pos[0])
-        #--        attn_mask[first_eos_pos_k + 1 : starting_pos_k + N] = 0
-        #--        attn_mask[first_eos_pos_l + 1 : starting_pos_l + N] = 0
 
         # Build structural block mask
         num_heads = getattr(self.cfg, 'num_attention_heads', 28)

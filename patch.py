@@ -19,23 +19,22 @@ def _clone_layer(layer):
 
 def select_batch(cache: Cache, indices, n_rewind: int = 0) -> DynamicCache:
     selector = ... if n_rewind <= 0 else slice(0, -n_rewind)
+    indices = indices if isinstance(indices, torch.Tensor) else torch.tensor(indices, dtype=torch.long, device=cache.layers[0].keys.device)
     new_cache = DynamicCache()
-    idx = torch.tensor(indices, device=cache.layers[0].keys.device)
     for layer in cache.layers:
         new_layer = _clone_layer(layer)
-        new_layer.keys = layer.keys[:, :, selector].index_select(0, idx)
-        new_layer.values = layer.values[:, :, selector].index_select(0, idx)
+        new_layer.keys = layer.keys[:, :, selector].index_select(0, indices)
+        new_layer.values = layer.values[:, :, selector].index_select(0, indices)
         new_cache.layers.append(new_layer)
     return new_cache
 
-def merge_batch(dst: Cache, src: Cache, indices: List[int]):
+def merge_batch(dst: Cache, src: Cache, indices):
     if not indices:
         return
-    idx = torch.tensor(indices, device=src.layers[0].keys.device)
     for dl, sl in zip(dst.layers, src.layers):
         src_seq = sl.keys.shape[2]
-        dl.keys[idx, :, :src_seq, :] = sl.keys
-        dl.values[idx, :, :src_seq, :] = sl.values
+        dl.keys[indices, :, :src_seq, :] = sl.keys
+        dl.values[indices, :, :src_seq, :] = sl.values
 
 def empty_like(cache: Cache, extra_seq: int) -> DynamicCache:
     new_cache = DynamicCache()
@@ -62,11 +61,7 @@ def _select_tokens(probs: torch.Tensor, do_sample: bool) -> torch.LongTensor:
     return samples.reshape(*probs.shape[:-1])
 
 def _softmax_with_temperature(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    if temperature <= 0.0:
-        temperature = 1.0
-    if temperature != 1.0:
-        logits = logits / temperature
-    return torch.softmax(logits, dim=-1)
+    return torch.softmax(logits / temperature, dim=-1)
 
 def _apply_top_k(probs: torch.Tensor, top_k: Optional[int]) -> torch.Tensor:
     if top_k is None or top_k <= 0 or top_k >= probs.shape[-1]:
@@ -287,12 +282,11 @@ def forward_jacobi(
                 trajectory[orig_idx].append(out[orig_idx, 1:].clone())
             else:
                 # Save final KV cache
-                for dl, sl in zip(past_kv_fin.layers, past_kv_unfin.layers):
-                    src_keys = sl.keys[n:n+1, :, :-1, :]
-                    src_values = sl.values[n:n+1, :, :-1, :]
-                    src_seq = src_keys.shape[2]
-                    dl.keys[orig_idx:orig_idx+1, :, :src_seq, :] = src_keys
-                    dl.values[orig_idx:orig_idx+1, :, :src_seq, :] = src_values
+                merge_batch(
+                    past_kv_fin,
+                    select_batch(past_kv_unfin, [n], n_rewind=1),
+                    [orig_idx]
+                )
 
         unfinished_mask = total_accepted < L
         if not unfinished_mask.any():

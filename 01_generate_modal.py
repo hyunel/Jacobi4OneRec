@@ -3,7 +3,7 @@ from modal_app import app
 from pathlib import Path
 
 DATASETS = [
-    "/mnt/OpenOneRec/output/sft_product_rec.parquet",
+    # "/mnt/OpenOneRec/output/sft_product_rec.parquet",
     # "/mnt/OpenOneRec/output/sft_video_rec.parquet",
     # "/mnt/OpenOneRec/output/sft_ad_rec.parquet",
     # "/mnt/OpenOneRec/output/sft_interactive_rec.parquet",
@@ -12,28 +12,26 @@ DATASETS = [
     # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_1_000000.parquet",
     # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_2_000000.parquet",
     # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_3_000000.parquet",
-    # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_4_000000.parquet",
-    # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_5_000000.parquet",
-    # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_6_000000.parquet",
-    # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_7_000000.parquet",
+    "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_4_000000.parquet",
+    "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_5_000000.parquet",
+    "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_6_000000.parquet",
+    "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_7_000000.parquet",
 ]
 
 OUTPUT_DIR = Path("/mnt/outputs/")
 
 @app.function(
     gpu="A100-40GB",
-    timeout=60 * 60 * 1,
+    timeout=60 * 60 * 24,
 )
 def launch_generation():
     args = [
         "python", "01_generate.py",
         "--model", "/mnt/OpenOneRec/data/OneRec-1.7B/",
         "--n_token_seq_len", "32",
-        "--max_model_len", "16384",
-        "--max_blocks", "64",
-        "--max_prompt_len", "4096",
-        "--gpu_memory_utilization", "0.9",
-        "--batch_size", "8",
+        "--max_prompt_len", "2048",
+        "--max_new_seq_len", "1024",
+        "--batch_size", "32",
         "--temperature", "0.75",
         "--top_k", "20",
         "--top_p", "0.95",
