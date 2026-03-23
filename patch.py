@@ -113,6 +113,7 @@ def forward_jacobi(
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
     past_key_values: Optional[Cache] = None,
+    trajectories: Optional[List[List[torch.LongTensor]]] = None,
     **kwargs
 ):
     temperature = float(kwargs.get("temperature", 1.0))
@@ -194,7 +195,10 @@ def forward_jacobi(
     next_tokens = torch.zeros(B, 1, dtype=input_ids.dtype, device=device)
     past_kv_fin = empty_like(past_key_values, extra_seq=L-1)
 
-    trajectory = [[ input_ids[i, 1:].clone() ] for i in range(B)]
+    if trajectories:
+        for i in range(B):
+            trajectories[i].append(out[i, 1:].clone()) # skip initial anchor token
+
     while True:
         # Select unfinished samples
         idx_unfin = unfinished_mask.nonzero(as_tuple=False).squeeze(1)
@@ -279,7 +283,8 @@ def forward_jacobi(
                 ])
 
                 next_tokens[orig_idx] = next_token
-                trajectory[orig_idx].append(out[orig_idx, 1:].clone())
+                if trajectories is not None:
+                    trajectories[orig_idx].append(out[orig_idx, 1:].clone())
             else:
                 # Save final KV cache
                 merge_batch(
@@ -292,4 +297,4 @@ def forward_jacobi(
         if not unfinished_mask.any():
             break
 
-    return past_kv_fin, next_tokens, trajectory
+    return past_kv_fin, next_tokens

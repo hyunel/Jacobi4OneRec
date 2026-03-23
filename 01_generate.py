@@ -175,17 +175,7 @@ def main(args: argparse.Namespace):
             )
 
             seq_length = attention_mask.sum(dim=-1)
-            trajectories = [[] for _ in range(B)]
-
             for i_block in range(max_blocks):
-                active_idx = [
-                    i for i, traj in enumerate(trajectories)
-                    if (not traj) or (not (traj[-1][-1] == tokenizer.eos_token_id).any())
-                ]
-
-                if not active_idx:
-                    break
-
                 q_sampled = torch.randint(0, tokenizer.vocab_size, (B, args.n_token_seq_len), device=model.device)
 
                 input_ids = torch.cat((next_token, q_sampled), dim=-1)
@@ -197,7 +187,8 @@ def main(args: argparse.Namespace):
                     torch.ones(B, args.n_token_seq_len+1, device=attention_mask.device, dtype=attention_mask.dtype)
                 ), dim=-1)
 
-                past_key_values, next_token, trajectory = model.forward_jacobi(
+                trajectories = [[] for _ in range(B)]
+                past_key_values, next_token = model.forward_jacobi(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -205,13 +196,21 @@ def main(args: argparse.Namespace):
                     temperature=args.temperature,
                     top_k=args.top_k,
                     top_p=args.top_p,
+                    trajectories=trajectories
                 )
                 attention_mask = attention_mask[:, :-1]
 
+                active_idx = [
+                    i for i, traj in enumerate(trajectories)
+                    if (not traj) or (not (traj[-1][-1] == tokenizer.eos_token_id).any())
+                ]
+
                 for i in active_idx:
-                    trajectories[i].append(trajectory[i])
-                    decoded = tokenizer.decode(trajectory[i][-1], skip_special_tokens=False)
+                    decoded = tokenizer.decode(trajectories[i][-1], skip_special_tokens=False)
                     console.print(f"[dim][Sample {i}][/dim] {decoded}")
+
+                if not active_idx:
+                    break
 
                 progress.update(
                     block_task,
