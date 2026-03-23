@@ -18,20 +18,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-$SCRIPT_DIR/.venv/bin/python}"
 
 # Constants for 02_window.py required arguments.
-WINDOW_SIZE=8
+WINDOW_SIZE=16
 MIN_NOISY_RATIO=0.0
 MAX_NOISY_RATIO=1.0
-N_TOKEN_SEQ_LENGTH=64
+N_TOKEN_SEQ_LENGTH=32
 STRATEGY="progressive"
-
-# Optional arguments.
-NUM_WORKERS="${NUM_WORKERS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
-CACHE_DIR="${CACHE_DIR:-}"
-EXTRA_ARGS=()
-
-if [[ -n "$CACHE_DIR" ]]; then
-  EXTRA_ARGS+=("--cache-dir" "$CACHE_DIR")
-fi
 
 OUTPUT_DIR="${OUTPUT_DIR:-${INPUT_DIR%/}_windowed}"
 mkdir -p "$OUTPUT_DIR"
@@ -57,8 +48,6 @@ for input_path in "${PARQUET_FILES[@]}"; do
     --window_size "$WINDOW_SIZE" \
     --min_noisy_ratio "$MIN_NOISY_RATIO" \
     --max_noisy_ratio "$MAX_NOISY_RATIO" \
-    --n_token_seq_length "$N_TOKEN_SEQ_LENGTH" \
-    --strategy "$STRATEGY" \
-    --num-workers "$NUM_WORKERS" \
-    "${EXTRA_ARGS[@]}"
+    --n_token_seq_len "$N_TOKEN_SEQ_LENGTH" \
+    --strategy "$STRATEGY"
 done

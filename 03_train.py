@@ -1,221 +1,252 @@
+from pathlib import Path
 from dataclasses import dataclass, field
-import math
-import pathlib
-from typing import Dict, Optional, List
-
-import os
-import sys
-import torch
-from torch.utils.data import Dataset
-import transformers
-from transformers.trainer_pt_utils import LabelSmoother
-import logging
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 from datasets import load_dataset
-from trainer import CllmTrainer
 
-logger = logging.getLogger(__name__)
-IGNORE_TOKEN_ID = LabelSmoother.ignore_index
-
-@dataclass
-class ModelArguments:
-    target_model_path: Optional[str] = field(
-        default="models/vicuna-7b-v1.5",
-        metadata={"help": "Path or HF id for the base model"},
-    )
-    qlora: bool = field(default=False, metadata={"help": "Enable QLoRA"})
+import peft
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, Trainer, TrainingArguments
+from torch.nn.attention.flex_attention import create_block_mask
 
 @dataclass
-class DataArguments:
-    data_path: str = field(default=None, metadata={"help": "Path to the training data JSONL"})
-    lazy_preprocess: bool = True
+class Arguments(TrainingArguments):
+    use_lora : bool = field(default=False, metadata={"help": "Whether to use LoRA for fine-tuning"})
+    lora_r: int = field(default=32, metadata={"help": "LoRA rank"})
+    lora_alpha: int = field(default=16, metadata={"help": "LoRA alpha"})
+    lora_dropout: float = field(default=0.05, metadata={"help": "LoRA dropout"})
 
-@dataclass
-class TrainingArguments(transformers.TrainingArguments):
-    cache_dir: Optional[str] = field(default=None)
-    optim: str = field(default="adamw_torch")
-    model_max_length: int = field(
-        default=1024, metadata={"help": "Max seq length for tokenizer/model"}
-    )
-    max_new_tokens: int = field(
-        default=64, metadata={"help": "N_BLOCK in the Jacobi trajectory (keep at 64 unless you changed preprocessing)"}
-    )
-    report_to: str = field(default="wandb")
-    use_gt_labels: bool = field(default=False)
-    remove_unused_columns: bool = field(default=False)
-    gradient_checkpointing: bool = field(
-        default=True,
-        metadata={"help": "Enable gradient checkpointing to reduce activation memory"},
-    )
-    bf16: bool = field(
-        default=True, metadata={"help": "Train in bfloat16. Keep True for FA2/SDPA efficiency."}
-    )
-    fp16: bool = field(default=False)
+    max_blocks: int = field(default=32, metadata={"help": "Maximum number of blocks to train on"})
+    model_path: str = field(default=None, metadata={"help": "Path or HF id for the base model"})
+    data_path: str = field(default=None, metadata={"help": "Path to the training data"})
 
-    max_pairs_per_step: int = field(
-        default=10,
-        metadata={"help": "How many (k_j, last_j) pairs to use per training step (<= 0 means use all)"},
-    )
+    def __post_init__(self):
+        super().__post_init__()
+        self.remove_unused_columns = False
 
-def rank0_print(local_rank, *args):
-    if local_rank in (0, -1):
-        print(*args)
+class JacobiTrainer(Trainer):
+    def __init__(
+            self,
+            tokenizer,
+            n_token_seq_len,
+            distill_temperature=1.0,
+            ar_loss_weight=10.0,
+            *args, **kwargs
+        ):
+        super().__init__(*args, **kwargs)
 
-def safe_save_model_for_hf_trainer(model, tokenizer, output_dir, accelerator=None):
-    """
-    Save weights. Works with Accelerator/DeepSpeed:
-    - If accelerator provided, unwrap first.
-    - If ZeRO-3, make sure your ds_config has stage3_gather_16bit_weights_on_model_save=true,
-      otherwise rely on engine.save_checkpoint inside the trainer.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    to_save = model
-    if accelerator is not None:
-        to_save = accelerator.unwrap_model(model)
-    if hasattr(to_save, "module"):
-        to_save = to_save.module
-    to_save.save_pretrained(output_dir, safe_serialization=False)
-    if tokenizer is not None:
-        tokenizer.save_pretrained(output_dir)
-
-def preprocess_training_sequence(
-    prompt_ids: List[int],
-    prompt_ids_len: int,
-    complete_training_sequence_ids: List[int],
-    tokenizer: transformers.PreTrainedTokenizer,
-    model: str,
-    traj_position_indices: List[int],
-) -> Dict:
-    prompt_ids = torch.tensor(prompt_ids, dtype=torch.long)
-    complete_training_sequence_ids = torch.tensor(complete_training_sequence_ids, dtype=torch.long)
-    #labels_ids = torch.tensor(labels_ids, dtype=torch.long)
-    return dict(
-        prompt_ids=prompt_ids,
-        prompt_ids_len=prompt_ids_len,
-        input_ids=complete_training_sequence_ids,
-        #labels_ids=labels_ids,
-        traj_position_indices=torch.tensor(traj_position_indices, dtype=torch.long).unsqueeze(0),
-    )
-
-class JacobianDataset(Dataset):
-    def __init__(self, raw_data, tokenizer, model: str, do_eval: bool=False, local_rank: int=-1):
-        super().__init__()
         self.tokenizer = tokenizer
-        self.raw_data = raw_data
-        self.cached_data_dict = {}
-        self.do_eval = do_eval
-        self.model = model
-        rank0_print(local_rank, "Formatting inputs (lazy)...")
+        self.n_token_seq_len = n_token_seq_len
+        self.distill_temperature = distill_temperature
+        self.ar_loss_weight = ar_loss_weight
 
-    def __len__(self):
-        return len(self.raw_data)
+        self.create_block_mask = torch.compile(create_block_mask)
 
-    def __getitem__(self, i) -> Dict:
-        if i in self.cached_data_dict:
-            return self.cached_data_dict[i]
-        sample = self.raw_data[i]
-        ret = preprocess_training_sequence(
-            sample["prompt_ids"],
-            sample["prompt_ids_len"],
-            sample["complete_training_sequence_ids"],
-            self.tokenizer,
-            self.model,
-            traj_position_indices=sample["traj_position_indices"],
+    def _create_mask(
+            self,
+            n_pads: torch.Tensor,
+            n_prompt: torch.Tensor,
+            n_sequence: torch.Tensor,
+            n_batch_size: torch.Tensor,
+        ):
+        def mask_mod(b, h, q_idx, kv_idx):
+            n_pad = n_pads[b]
+
+            causal_mask = q_idx >= kv_idx
+            pad_mask = kv_idx >= n_pad
+
+            # block alignment mask
+            q_block_idx = (q_idx - n_prompt) // self.n_token_seq_len
+            kv_block_idx = (kv_idx - n_prompt) // self.n_token_seq_len
+            alignment_mask = (q_block_idx % 2) == (kv_block_idx % 2)
+
+            # combine all masks
+            is_prompt_kv = kv_idx < n_prompt
+            valid_mask = is_prompt_kv | alignment_mask
+
+            return causal_mask & pad_mask & valid_mask
+
+        return self.create_block_mask(
+            mask_mod, B=n_batch_size, H=None, Q_LEN=n_sequence, KV_LEN=n_sequence, device=self.args.device,
         )
-        self.cached_data_dict[i] = ret
-        return ret
 
-def make_jacobian_data_module(tokenizer, trajectory_data, data_args, model: str, local_rank: int) -> Dict:
-    assert data_args.lazy_preprocess, "only support lazy preprocess"
-    train_dataset = JacobianDataset(trajectory_data, tokenizer=tokenizer, model=model, local_rank=local_rank)
-    return dict(train_dataset=train_dataset, eval_dataset=None)
-
-def train():
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
-    training_args.local_rank = local_rank
-    training_args.qlora = model_args.qlora
-
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-        level=logging.INFO if local_rank in (0, -1) else logging.ERROR,
-    )
-    if local_rank in (0, -1):
-        transformers.utils.logging.set_verbosity_info()
-    else:
-        transformers.utils.logging.set_verbosity_error()
-
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}, "
-        f"distributed training: {bool(training_args.local_rank != -1)}, bf16: {training_args.bf16}, fp16: {training_args.fp16}"
-    )
-    logger.info(f"Training/eval parameters {training_args}")
-
-    config = transformers.AutoConfig.from_pretrained(
-        model_args.target_model_path, cache_dir=training_args.cache_dir
-    )
-    orig_ctx_len = getattr(config, "max_position_embeddings", None)
-    if orig_ctx_len and training_args.model_max_length > orig_ctx_len:
-        raise ValueError(
-            f"Use rope scaling is not supported: "
-            f"model_max_length ({training_args.model_max_length}) > orig_ctx_len ({orig_ctx_len})"
+    def _compute_ar_loss(self, logits, input_ids, answer_mask):
+        batch_ids = torch.arange(logits.size(0), device=logits.device)[:, None].expand_as(answer_mask)[answer_mask]
+        answer_logits = logits[answer_mask]
+        answer_targets = input_ids[answer_mask]
+        keep = batch_ids[:-1] == batch_ids[1:]
+        if not keep.any():
+            return logits.sum() * 0
+        return torch.nn.functional.cross_entropy(
+            answer_logits[:-1][keep].float(),
+            answer_targets[1:][keep],
         )
-    config.use_cache = False
 
-    # Model + Tokenizer
-    attn_impl = "flex_attention"
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.target_model_path,
-        config=config,
-        cache_dir=training_args.cache_dir,
-        attn_implementation=attn_impl,
-        torch_dtype=torch.bfloat16 if training_args.bf16 else (torch.float16 if training_args.fp16 else None),
+    def _compute_consistency_loss(self, logits, n_blocks, block_mask, answer_mask):
+        T = self.distill_temperature
+        student = logits[block_mask].float() / T
+        teacher = logits[answer_mask].detach().float() / T # no gradient to teacher
+        if student.numel() == 0:
+            return logits.sum() * 0
+
+        per_token = -(teacher.softmax(dim=-1) * student.log_softmax(dim=-1)).sum(dim=-1)
+        batch_ids = torch.arange(logits.size(0), device=logits.device)[:, None].expand_as(block_mask)[block_mask]
+        loss_per_sample = torch.zeros(logits.size(0), device=logits.device, dtype=per_token.dtype)
+        loss_per_sample.scatter_add_(0, batch_ids, per_token)
+        loss_per_sample = loss_per_sample / n_blocks.clamp_min(1)
+        return loss_per_sample.mean() * (T * T) / self.n_token_seq_len
+
+    def compute_loss(self, model, inputs, return_outputs = False, **kwargs):
+        B, L = inputs["input_ids"].shape
+
+        attention_mask = self._create_mask(
+            n_pads=inputs["n_pads"],
+            n_prompt=inputs["n_prompt"],
+            n_sequence=L,
+            n_batch_size=B,
+        )
+
+        outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=attention_mask,
+            position_ids=inputs["position_ids"],
+            attn_implementation="flex_attention",
+        )
+
+        # Extract the relevant logits
+        device = inputs["input_ids"].device
+        seq_idx = torch.arange(L, device=device).unsqueeze(0)
+
+        tail_offset = seq_idx - inputs["n_prompt"]
+        valid_tail = (tail_offset >= 0) & (
+            tail_offset < (2 * inputs["n_blocks"].unsqueeze(1) * self.n_token_seq_len)
+        )
+
+        is_answer_chunk = ((tail_offset // self.n_token_seq_len) % 2) == 1
+
+        answer_mask = valid_tail & is_answer_chunk
+        block_mask = valid_tail & (~is_answer_chunk)
+
+        # Calculate losses
+        logits = outputs.logits
+        loss_ar = self._compute_ar_loss(logits, inputs["input_ids"], answer_mask)
+        loss_consistency = self._compute_consistency_loss(logits, inputs["n_blocks"], block_mask, answer_mask)
+
+        loss = loss_ar * self.ar_loss_weight + loss_consistency
+
+        return (loss, outputs) if return_outputs else loss
+
+class JacobiDataCollator:
+    def __init__(self, n_token_seq_len):
+        self.n_token_seq_len = n_token_seq_len
+
+    @staticmethod
+    def _write_chunk(dst_ids, i_row, i_start, seq):
+        seq_len = len(seq)
+        if seq_len == 0:
+            return
+        end_idx = i_start + seq_len
+        dst_ids[i_row, i_start:end_idx] = torch.tensor(seq, dtype=torch.long)
+
+    def __call__(self, features):
+        # Example: ([PR] = prompt, [B#] = block #, [A#] = answer for block #, [PD] = padding)
+        # [PR] [PR] [PR] [PR] [B1] [A1] [B2] [A2] [B3] [A3] [PD] [PD]
+        #  0    1    2    3    4    4    5    5    6    6    *    *
+        # [PD] [PR] [PR] [PR] [B1] [A1] [B2] [A2] [B3] [A3] [B4] [A4]
+        #  *    0    1    2    3    3    4    4    5    5    6    6
+
+        B = len(features)
+
+        n_blocks = [len(feature["blocks"]) for feature in features]
+        max_n_blocks = max(n_blocks)
+        max_n_prompt = max(len(feature["prompt_ids"]) for feature in features)
+
+        total_len = max_n_prompt + 2 * max_n_blocks * self.n_token_seq_len
+
+        n_pads = torch.empty(B, dtype=torch.long)
+        input_ids = torch.zeros((B, total_len), dtype=torch.long)
+        position_ids = torch.zeros((B, total_len), dtype=torch.long)
+
+        for i_row, feature in enumerate(features):
+            prompt_ids = feature["prompt_ids"]
+            blocks = feature["blocks"]
+            answers = feature["answers"]
+
+            n_prompt = len(prompt_ids)
+            n_pad = max_n_prompt - n_prompt
+            n_pads[i_row] = n_pad
+
+            self._write_chunk(input_ids, i_row, n_pad, prompt_ids)
+            position_ids[i_row, n_pad:max_n_prompt] = torch.arange(n_prompt, dtype=torch.long)
+
+            for block_idx, (block, answer) in enumerate(zip(blocks, answers)):
+                assert len(block) == len(answer) == self.n_token_seq_len, f"Expected block and answer to have length {self.n_token_seq_len}, but got {len(block)} and {len(answer)}"
+
+                i_start = max_n_prompt + 2 * block_idx * self.n_token_seq_len
+                block_pos = n_prompt + block_idx * self.n_token_seq_len
+
+                self._write_chunk(input_ids, i_row, i_start, block)
+                self._write_chunk(input_ids, i_row, i_start + self.n_token_seq_len, answer)
+                block_pos_ids = torch.arange(block_pos, block_pos + self.n_token_seq_len, dtype=torch.long)
+                position_ids[i_row, i_start:i_start + self.n_token_seq_len] = block_pos_ids
+                position_ids[i_row, i_start + self.n_token_seq_len:i_start + 2 * self.n_token_seq_len] = block_pos_ids
+
+        return {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "n_pads": n_pads,
+            "n_blocks": torch.tensor(n_blocks, dtype=torch.long),
+            "n_prompt": torch.tensor(max_n_prompt, dtype=torch.long),
+        }
+
+def main(args: Arguments):
+    # Load the dataset
+    dataset = load_dataset("parquet", data_files=args.data_path, split="train").map(lambda x: {
+        **x,
+        "blocks": [ block for block in x["blocks"][:args.max_blocks] ],
+    })
+
+    # Load the model+tokenizer
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        attn_implementation='flex_attention',
+        dtype=torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None),
         low_cpu_mem_usage=True,
     )
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.target_model_path, padding_side="right", use_fast=False
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path
     )
 
-    # Gradient checkpointing
-    if getattr(training_args, "gradient_checkpointing", False):
-        model.gradient_checkpointing_enable()
+    if args.use_lora:
+        lora_config = peft.LoraConfig(
+            task_type=peft.TaskType.CAUSAL_LM,
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+        )
+        model = peft.get_peft_model(model, lora_config)
 
-    if model_args.qlora:
-        model = prepare_model_for_kbit_training(model)
-        lora_cfg = LoraConfig(task_type=TaskType.CAUSAL_LM, r=32, lora_alpha=16, lora_dropout=0.05)
-        model = get_peft_model(model, lora_cfg)
-
-    # Data Prep
-    trajectory_dataset = load_dataset(
-        "parquet", data_files={"train": data_args.data_path}, split="train", cache_dir=training_args.cache_dir
-    )
-    data_module = make_jacobian_data_module(
-        tokenizer=tokenizer,
-        trajectory_data=trajectory_dataset,
-        data_args=data_args,
-        model=model_args.target_model_path,
-        local_rank=training_args.local_rank,
-    )
-
-    # trainer
-    trainer = CllmTrainer(
+    # Trainer
+    n_token_seq_len = len(dataset[0]["blocks"][0])
+    trainer = JacobiTrainer(
         model=model,
-        args=training_args,
-        train_dataset=data_module["train_dataset"],
         tokenizer=tokenizer,
+        args=args,
+        train_dataset=dataset,
+        data_collator=JacobiDataCollator(
+            n_token_seq_len=n_token_seq_len
+        ),
+        n_token_seq_len=n_token_seq_len,
     )
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    if any(Path(args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
 
-    trainer.save_model(training_args.output_dir)
+    trainer.save_model(args.output_dir)
     if trainer.is_world_process_zero():
-        tokenizer.save_pretrained(training_args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+
 
 if __name__ == "__main__":
-    train()
+    parser = HfArgumentParser(Arguments)
+    main(parser.parse_args_into_dataclasses()[0])
