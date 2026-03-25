@@ -73,7 +73,12 @@ def main(args: argparse.Namespace):
     )
     model.forward_jacobi = forward_jacobi.__get__(model) # Monkey patching the method to the model instance
 
+    if args.lora:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, args.lora, device_map="cuda")
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer.padding_side = "left"
 
     def _tokenize(x):
         prompts = tokenizer.apply_chat_template(
@@ -109,7 +114,7 @@ def main(args: argparse.Namespace):
     max_blocks = (args.max_new_seq_len + args.n_token_seq_len - 1) // args.n_token_seq_len
     with Progress(console=console) as progress:
         task = progress.add_task("Generating batches...", total=n_dataset)
-        block_task = progress.add_task("Current batch blocks", total=max_blocks, visible=False)
+        block_task = progress.add_task("Current blocks", total=max_blocks)
 
         for batch in dataset:
             for i in range(len(batch['uuid'])):
@@ -151,14 +156,6 @@ def main(args: argparse.Namespace):
             )
 
             # Generation Phase
-            progress.update(
-                block_task,
-                completed=0,
-                total=max_blocks,
-                description=f"Current batch blocks (0/{max_blocks})",
-                visible=True,
-            )
-
             seq_length = attention_mask.sum(dim=-1)
 
             for i_block in range(max_blocks):
@@ -174,7 +171,7 @@ def main(args: argparse.Namespace):
                 ), dim=-1)
 
                 trajectories = [[] for _ in range(B)]
-                past_key_values, next_token = model.forward_jacobi(
+                past_key_values, next_token, metrics = model.forward_jacobi(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -182,7 +179,8 @@ def main(args: argparse.Namespace):
                     temperature=args.temperature,
                     top_k=args.top_k,
                     top_p=args.top_p,
-                    trajectories=trajectories
+                    trajectories=trajectories,
+                    return_metrics=True,
                 )
                 attention_mask = attention_mask[:, :-1]
 
@@ -201,10 +199,14 @@ def main(args: argparse.Namespace):
                 progress.update(
                     block_task,
                     completed=i_block + 1,
-                    description=f"Current batch blocks ({i_block + 1}/{max_blocks})",
+                    description=(
+                        f"Current blocks ({i_block + 1}/{max_blocks}) | "
+                        f"tpf={metrics['tokens_per_forward']:.2f} "
+                        f"fw={metrics['num_forwards']:.2f}"
+                    ),
                 )
 
-            progress.update(block_task, visible=False)
+            progress.update(block_task)
 
 
 if __name__ == "__main__":
@@ -218,6 +220,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.75)
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--lora", type=Path, help="Path to LoRA weights in Hugging Face format (optional).")
     args = parser.parse_args()
 
     main(args)

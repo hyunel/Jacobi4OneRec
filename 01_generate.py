@@ -124,7 +124,7 @@ def main(args: argparse.Namespace):
     max_blocks = (args.max_new_seq_len + args.n_token_seq_len - 1) // args.n_token_seq_len
     with pq.ParquetWriter(args.output, schema) as writer, progress:
         task = progress.add_task("Generating batches...", total=n_dataset)
-        block_task = progress.add_task("Current batch blocks", total=max_blocks, visible=False)
+        block_task = progress.add_task("Current blocks", total=max_blocks)
 
         for batch in dataset:
             for i in range(len(batch['uuid'])):
@@ -166,14 +166,6 @@ def main(args: argparse.Namespace):
             )
 
             # Generation Phase
-            progress.update(
-                block_task,
-                completed=0,
-                total=max_blocks,
-                description=f"Current batch blocks (0/{max_blocks})",
-                visible=True,
-            )
-
             seq_length = attention_mask.sum(dim=-1)
             for i_block in range(max_blocks):
                 q_sampled = torch.randint(0, tokenizer.vocab_size, (B, args.n_token_seq_len), device=model.device)
@@ -215,10 +207,10 @@ def main(args: argparse.Namespace):
                 progress.update(
                     block_task,
                     completed=i_block + 1,
-                    description=f"Current batch blocks ({i_block + 1}/{max_blocks})",
+                    description=f"Current blocks ({i_block + 1}/{max_blocks})",
                 )
 
-            progress.update(block_task, visible=False)
+            progress.update(block_task)
 
             # Write batch to parquet
             masks = model_inputs["attention_mask"].bool()

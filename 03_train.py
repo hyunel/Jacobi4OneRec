@@ -38,7 +38,8 @@ class JacobiTrainer(Trainer):
         self.distill_temperature = distill_temperature
         self.ar_loss_weight = ar_loss_weight
 
-        self._custom_metrics = {}
+        self._metrics_sum = {}
+        self._metrics_count = 0
         self.create_block_mask = torch.compile(create_block_mask)
 
     def _create_mask(
@@ -69,26 +70,42 @@ class JacobiTrainer(Trainer):
             mask_mod, B=n_batch_size, H=None, Q_LEN=n_sequence, KV_LEN=n_sequence, device=self.args.device,
         )
 
-    def _compute_ar_loss(self, logits, input_ids, answer_mask):
-        batch_ids = torch.arange(logits.size(0), device=logits.device)[:, None].expand_as(answer_mask)[answer_mask]
-        answer_logits = logits[answer_mask]
-        answer_targets = input_ids[answer_mask]
-        keep = batch_ids[:-1] == batch_ids[1:]
-        if not keep.any():
-            return logits.sum() * 0
+    def _compute_ar_loss(self, logits, input_ids, answer_mask, n_blocks, n_prompt):
+        # Construct predictor mask
+        predictor_mask = answer_mask.clone()
+        b_idx = torch.arange(logits.size(0), device=logits.device)
+        valid_b = n_blocks > 0
+
+        # 1. Add Prompt[-1] as the predictor for A1_1
+        predictor_mask[valid_b, n_prompt - 1] = True
+
+        # 2. Remove the last valid A_K token as a predictor
+        last_idx = n_prompt + 2 * n_blocks * self.n_token_seq_len - 1
+        predictor_mask[b_idx[valid_b], last_idx[valid_b]] = False
+
         return torch.nn.functional.cross_entropy(
-            answer_logits[:-1][keep].float(),
-            answer_targets[1:][keep],
+            logits[predictor_mask].float(),
+            input_ids[answer_mask],
         )
 
-    def _compute_consistency_loss(self, logits, n_blocks, block_mask, answer_mask):
+    def _compute_consistency_loss(self, logits, block_mask, answer_mask, n_blocks):
         T = self.distill_temperature
         student = logits[block_mask].float() / T
         teacher = logits[answer_mask].detach().float() / T # no gradient to teacher
         if student.numel() == 0:
             return logits.sum() * 0
 
-        per_token = -(teacher.softmax(dim=-1) * student.log_softmax(dim=-1)).sum(dim=-1)
+        per_token = torch.nn.functional.cross_entropy(
+            student,
+            teacher.softmax(dim=-1), # soft label
+            reduction="none"
+        )
+
+        # Apply linearly decreasing weights [1.5 -> 1.0] to tokens within each block
+        # token_weights = torch.linspace(1.5, 1.0, steps=self.n_token_seq_len, device=logits.device)
+        # token_weights = token_weights.repeat(n_blocks.sum())
+        # per_token = per_token * token_weights
+
         batch_ids = torch.arange(logits.size(0), device=logits.device)[:, None].expand_as(block_mask)[block_mask]
         loss_per_sample = torch.zeros(logits.size(0), device=logits.device, dtype=per_token.dtype)
         loss_per_sample.scatter_add_(0, batch_ids, per_token)
@@ -128,21 +145,30 @@ class JacobiTrainer(Trainer):
 
         # Calculate losses
         logits = outputs.logits
-        loss_ar = self._compute_ar_loss(logits, inputs["input_ids"], answer_mask)
-        loss_consistency = self._compute_consistency_loss(logits, inputs["n_blocks"], block_mask, answer_mask)
+        loss_ar = self._compute_ar_loss(logits, inputs["input_ids"], answer_mask, inputs["n_blocks"], inputs["n_prompt"])
+        loss_consistency = self._compute_consistency_loss(logits, block_mask, answer_mask, inputs["n_blocks"])
 
         loss = loss_ar * self.ar_loss_weight + loss_consistency
 
-        self._custom_metrics = {
-            "loss_ar": loss_ar.detach().item(),
-            "loss_consistency": loss_consistency.detach().item(),
-        }
+        self._log_metrics(
+            loss_ar=loss_ar,
+            loss_consistency=loss_consistency
+        )
 
         return (loss, outputs) if return_outputs else loss
 
+    def _log_metrics(self, **metrics):
+        for k, v in metrics.items():
+            reduced = self.accelerator.reduce(v.detach().clone(), reduction="mean")
+            self._metrics_sum[k] = self._metrics_sum.get(k, 0.0) + reduced.item()
+        self._metrics_count += 1
+
     def log(self, logs, *args, **kwargs):
-        if "loss" in logs:
-            logs.update(self._custom_metrics)
+        if "loss" in logs and self._metrics_count > 0:
+            for k in self._metrics_sum:
+                logs[k] = self._metrics_sum[k] / self._metrics_count
+            self._metrics_sum = {}
+            self._metrics_count = 0
         return super().log(logs, *args, **kwargs)
 
 

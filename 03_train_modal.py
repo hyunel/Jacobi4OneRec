@@ -1,10 +1,10 @@
 from modal_app import app
 
-N_GPU = 2
+N_GPU = 4
 
 @app.function(
     gpu=f"A100-80GB:{N_GPU}",
-    timeout=60 * 60 * 6,
+    timeout=60 * 60 * 24,
 )
 # @modal.experimental.clustered(size=n_nodes)
 def launch_torchrun():
@@ -18,18 +18,24 @@ def launch_torchrun():
                 "--master_port=1234",
                 "03_train.py",
                 "--model_path", "/mnt/OpenOneRec/data/OneRec-1.7B/",
-                "--data_path", "/mnt/outputs/trajectory_windowed/*.parquet",
+                "--max_blocks", "16",
+
+                "--data_path", "/mnt/outputs/trajectory_n32w16/*.parquet",
                 "--output_dir", "/mnt/outputs/OneRec-1.7B-n32w16",
-                "--max_blocks", "32",
-                "--use_lora", "False",
+
+                # "--use_lora", "True",
+                # "--lora_r", "32",
+                # "--lora_alpha", "16",
+                # "--lora_dropout", "0.05",
+
+                "--per_device_train_batch_size", "4",
 
                 "--bf16",
                 "--report_to", "wandb",
                 "--do_train",
                 "--num_train_epochs", "1",
-                "--per_device_train_batch_size", "2",
                 "--save_strategy", "steps",
-                "--save_steps", "1000",
+                "--save_steps", "5000",
                 "--save_total_limit", "8",
                 "--learning_rate", "1e-5",
                 "--weight_decay", "0.",

@@ -12,16 +12,17 @@ DATASETS = [
     # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_1_000000.parquet",
     # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_2_000000.parquet",
     # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_3_000000.parquet",
-    "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_4_000000.parquet",
+    # "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_4_000000.parquet",
     "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_5_000000.parquet",
     "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_6_000000.parquet",
-    "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_7_000000.parquet",
+    "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_8_000000.parquet",
+    "/mnt/OpenOneRec/raw_data/general_text/sft/filtered_9_000000.parquet",
 ]
 
 OUTPUT_DIR = Path("/mnt/outputs/")
 
 @app.function(
-    gpu="A100-40GB",
+    gpu="A100-80GB",
     timeout=60 * 60 * 24,
 )
 def launch_generation():
@@ -31,7 +32,7 @@ def launch_generation():
         "--n_token_seq_len", "32",
         "--max_prompt_len", "2048",
         "--max_new_seq_len", "1024",
-        "--batch_size", "32",
+        "--batch_size", "64",
         "--temperature", "0.75",
         "--top_k", "20",
         "--top_p", "0.95",

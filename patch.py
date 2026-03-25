@@ -114,6 +114,7 @@ def forward_jacobi(
     position_ids: Optional[torch.LongTensor] = None,
     past_key_values: Optional[Cache] = None,
     trajectories: Optional[List[List[torch.LongTensor]]] = None,
+    return_metrics: bool = False,
     **kwargs
 ):
     temperature = float(kwargs.get("temperature", 1.0))
@@ -195,6 +196,9 @@ def forward_jacobi(
     next_tokens = torch.zeros(B, 1, dtype=input_ids.dtype, device=device)
     past_kv_fin = empty_like(past_key_values, extra_seq=L-1)
 
+    if return_metrics:
+        num_forwards = torch.zeros(B, dtype=torch.long, device=device)
+
     if trajectories:
         for i in range(B):
             trajectories[i].append(out[i, 1:].clone()) # skip initial anchor token
@@ -204,6 +208,9 @@ def forward_jacobi(
         idx_unfin = unfinished_mask.nonzero(as_tuple=False).squeeze(1)
         out_unfin = out[idx_unfin]
         past_kv_unfin = select_batch(past_key_values, idx_unfin)
+
+        if return_metrics:
+            num_forwards[idx_unfin] += 1
 
         # Forward pass
         inputs_embeds = self.model.embed_tokens(out_unfin[:, -L:])
@@ -296,5 +303,14 @@ def forward_jacobi(
         unfinished_mask = total_accepted < L
         if not unfinished_mask.any():
             break
+
+    if return_metrics:
+        total_tokens = (total_accepted - 1).clamp_min_(0).to(torch.float)
+        fw = num_forwards.clamp_min(1).to(torch.float)
+        return past_kv_fin, next_tokens, {
+            "total_tokens": float(total_tokens.mean().item()),
+            "num_forwards": float(num_forwards.to(torch.float).mean().item()),
+            "tokens_per_forward": float((total_tokens / fw).mean().item()),
+        }
 
     return past_kv_fin, next_tokens

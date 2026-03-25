@@ -25,11 +25,31 @@ def parse_args():
 
     return parser.parse_args()
 
+def process_block(args, prompt_ids, blocks, noise_ratios):
+    n_blocks = len(blocks)
+
+    # Determine which trajectory to select based on the strategy
+    if args.strategy == "random":
+        noise_idx = np.random.randint(0, args.window_size, size=n_blocks)
+    elif args.strategy == "progressive":
+        schedule = np.linspace(args.min_noisy_ratio, args.max_noisy_ratio, args.window_size)
+        noise_idx = [
+            int(np.argmin(np.abs(noise_ratios[j] - schedule[j % args.window_size])))
+            for j in range(n_blocks)
+        ]
+
+    return {
+        "prompt_ids": prompt_ids,
+        "blocks": [blocks[j][noise_idx[j]] for j in range(n_blocks)],
+        "answers": [block[-1] for block in blocks],
+    }
+
 def main(args):
     df = pd.read_parquet(args.input_path)
 
     with pq.ParquetWriter(args.output_path, SCHEMA) as writer:
         for row in track(df.itertuples(index=False), total=len(df), description="Processing trajectories"):
+            n_blocks = len(row.blocks)
 
             # Calculate noise ratios for each block
             noise_ratios = [
@@ -40,24 +60,25 @@ def main(args):
                 for block in row.blocks
             ]
 
-            # Determine which trajectory to select based on the strategy
-            if args.strategy == "random":
-                noise_idx = np.random.randint(0, args.window_size, size=len(row.blocks))
-            elif args.strategy == "progressive":
-                schedule = np.linspace(args.min_noisy_ratio, args.max_noisy_ratio, args.window_size)
-                noise_idx = [
-                    int(np.argmin(np.abs(np.asarray(block_noise_ratios) - schedule[i % args.window_size])))
-                    for i, block_noise_ratios in enumerate(noise_ratios)
-                ]
+            # Process each block
+            results = []
+            prompt_ids = row.prompt_ids
+            for i in range(n_blocks):
+                # For each block, prompt is the concatenation of the original prompt and the previous blocks
+                if i > 0:
+                    prompt_ids = np.concatenate([prompt_ids, row.blocks[i-1][-1]])
+
+                results.append(process_block(args, prompt_ids, row.blocks[i:], noise_ratios[i:]))
 
             # Write the selected trajectories to the output Parquet file
             writer.write_table(pa.table({
-                "uuid": [row.uuid],
-                "source": [row.source],
-                "prompt_ids": [row.prompt_ids],
-                "blocks": [[row.blocks[i][noise_idx[i]] for i in range(len(row.blocks))]],
-                "answers": [[block[-1] for block in row.blocks]],
+                "uuid": [row.uuid] * len(results),
+                "source": [row.source] * len(results),
+                "prompt_ids": [result["prompt_ids"] for result in results],
+                "blocks": [result["blocks"] for result in results],
+                "answers": [result["answers"] for result in results],
             }, schema=SCHEMA))
+
 
 if __name__ == "__main__":
     main(parse_args())

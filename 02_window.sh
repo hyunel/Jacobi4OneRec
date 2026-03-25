@@ -19,12 +19,12 @@ PYTHON_BIN="${PYTHON_BIN:-$SCRIPT_DIR/.venv/bin/python}"
 
 # Constants for 02_window.py required arguments.
 WINDOW_SIZE=16
-MIN_NOISY_RATIO=0.0
+MIN_NOISY_RATIO=0.2
 MAX_NOISY_RATIO=1.0
 N_TOKEN_SEQ_LENGTH=32
 STRATEGY="progressive"
 
-OUTPUT_DIR="${OUTPUT_DIR:-${INPUT_DIR%/}_windowed}"
+OUTPUT_DIR="${OUTPUT_DIR:-${INPUT_DIR%/}_n${N_TOKEN_SEQ_LENGTH}w${WINDOW_SIZE}}"
 mkdir -p "$OUTPUT_DIR"
 
 shopt -s nullglob
