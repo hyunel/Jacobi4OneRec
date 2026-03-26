@@ -2,10 +2,8 @@ import json
 import argparse
 import pyarrow.parquet as pq
 from pathlib import Path
-import torch
 from datasets import load_dataset, concatenate_datasets, Features, Value
 from rich.console import Console
-from rich.progress import Progress
 from transformers import AutoTokenizer
 from inference_engine.llm import LLM
 from inference_engine.sampling_params import SamplingParams
@@ -85,7 +83,7 @@ def main(args: argparse.Namespace):
         top_k=args.top_k,
         top_p=args.top_p,
         decode_strategy="jacobi",
-        jacobi_on_policy=True,
+        jacobi_on_policy=False,
 
         max_tokens=args.max_blocks * args.n_token_seq_len,
         jacobi_block_len=args.n_token_seq_len,
@@ -130,7 +128,7 @@ def main(args: argparse.Namespace):
             console.print(f"[dim] Messages: {batch['messages'][i]}[/dim]")
 
         for output in llm.generate(batch['input_ids'], sampling_params):
-            console.print(f"[green]Generated output: {output}[/green]")
+            console.print(f"[green]Generated output: {output['text']}[/green]")
 
 
 
@@ -142,7 +140,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_prompt_len", type=int, default=4096)
     parser.add_argument("--max_blocks", type=int, default=32)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.8)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--temperature", type=float, default=0.75)
     parser.add_argument("--top_k", type=int, default=20)

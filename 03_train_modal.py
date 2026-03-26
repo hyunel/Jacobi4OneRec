@@ -1,6 +1,6 @@
 from modal_app import app
 
-N_GPU = 4
+N_GPU = 2
 
 @app.function(
     gpu=f"A100-80GB:{N_GPU}",
@@ -18,17 +18,24 @@ def launch_torchrun():
                 "--master_port=1234",
                 "03_train.py",
                 "--model_path", "/mnt/OpenOneRec/data/OneRec-1.7B/",
-                "--max_blocks", "16",
+                "--data_path", "/mnt/outputs/trajectory_n32w16s1/*.parquet",
 
-                "--data_path", "/mnt/outputs/trajectory_n32w16/*.parquet",
-                "--output_dir", "/mnt/outputs/OneRec-1.7B-n32w16",
+                "--max_blocks", "32",
+                "--output_dir", "/mnt/outputs/OneRec-1.7B-n32w16m05",
+
+                # "--max_blocks", "32",
+                # "--output_dir", "/mnt/outputs/OneRec-1.7B-n32w16-lora",
 
                 # "--use_lora", "True",
                 # "--lora_r", "32",
                 # "--lora_alpha", "16",
                 # "--lora_dropout", "0.05",
 
-                "--per_device_train_batch_size", "4",
+                "--per_device_train_batch_size", "2",
+                "--consistency_scale", "1.0",
+                "--ar_loss_weight", "10.0",
+                "--distill_temperature", "1.0",
+                "--label_smoothing_factor", "0.1",
 
                 "--bf16",
                 "--report_to", "wandb",

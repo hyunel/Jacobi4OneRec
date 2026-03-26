@@ -4,7 +4,7 @@ import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-PATH = Path('outputs/trajectory_n32w16/jacobi_filtered_0_000000.parquet')
+PATH = Path('outputs/trajectory_n32w16s1/')
 MODEL_PATH = Path('outputs/OneRec-1.7B')
 
 df = pd.read_parquet(PATH)
@@ -65,5 +65,31 @@ plt.xlabel("Total Length")
 plt.ylabel("Frequency")
 plt.legend()
 plt.show()
+
+# %%
+# Plot group sizes by the first 100 prompt tokens
+prefix_length = 100
+prefix_groups = {}
+
+for row in df.itertuples(index=False):
+    prefix_key = tuple(row.prompt_ids[:prefix_length])
+    prefix_groups[prefix_key] = prefix_groups.get(prefix_key, 0) + 1
+
+group_sizes = sorted(prefix_groups.values(), reverse=True)
+group_indices = np.arange(len(group_sizes))
+
+plt.bar(group_indices, group_sizes, edgecolor='black')
+plt.xticks(group_indices[::max(1, len(group_indices) // 8)])
+plt.title(f"Group Sizes by First {prefix_length} Prompt Tokens")
+plt.xlabel("Group Index")
+plt.ylabel("Frequency")
+plt.show()
+
+print(f"Grouped {len(df)} samples into {len(group_sizes)} groups by first {prefix_length} prompt tokens")
+
+top_prefix_groups = sorted(prefix_groups.items(), key=lambda item: item[1], reverse=True)[:3]
+for rank, (prefix_key, count) in enumerate(top_prefix_groups, start=1):
+    decoded_prefix = tokenizer.decode(list(prefix_key), skip_special_tokens=False).replace("\n", "\\n")
+    print(f"Top {rank}: count={count}, prefix={decoded_prefix}")
 
 # %%

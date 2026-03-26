@@ -18,6 +18,10 @@ class Arguments(TrainingArguments):
     model_path: str = field(default=None, metadata={"help": "Path or HF id for the base model"})
     data_path: str = field(default=None, metadata={"help": "Path to the training data"})
 
+    ar_loss_weight: float = field(default=10.0, metadata={"help": "Weight for the autoregressive loss component"})
+    consistency_scale: float = field(default=1.0, metadata={"help": "Scaling factor for the consistency loss"})
+    distill_temperature: float = field(default=1.0, metadata={"help": "Temperature for the consistency loss distillation"})
+
     def __post_init__(self):
         super().__post_init__()
         self.remove_unused_columns = False
@@ -27,8 +31,9 @@ class JacobiTrainer(Trainer):
             self,
             tokenizer,
             n_token_seq_len,
-            distill_temperature=1.0,
-            ar_loss_weight=10.0,
+            distill_temperature,
+            ar_loss_weight,
+            consistency_scale,
             *args, **kwargs
         ):
         super().__init__(*args, **kwargs)
@@ -37,6 +42,7 @@ class JacobiTrainer(Trainer):
         self.n_token_seq_len = n_token_seq_len
         self.distill_temperature = distill_temperature
         self.ar_loss_weight = ar_loss_weight
+        self.consistency_scale = consistency_scale
 
         self._metrics_sum = {}
         self._metrics_count = 0
@@ -86,6 +92,7 @@ class JacobiTrainer(Trainer):
         return torch.nn.functional.cross_entropy(
             logits[predictor_mask].float(),
             input_ids[answer_mask],
+            label_smoothing=self.args.label_smoothing_factor,
         )
 
     def _compute_consistency_loss(self, logits, block_mask, answer_mask, n_blocks):
@@ -101,10 +108,10 @@ class JacobiTrainer(Trainer):
             reduction="none"
         )
 
-        # Apply linearly decreasing weights [1.5 -> 1.0] to tokens within each block
-        # token_weights = torch.linspace(1.5, 1.0, steps=self.n_token_seq_len, device=logits.device)
-        # token_weights = token_weights.repeat(n_blocks.sum())
-        # per_token = per_token * token_weights
+        # Apply linearly decreasing weights [consistency_scale -> 1.0] to tokens within each block
+        token_weights = torch.linspace(self.consistency_scale, 1.0, steps=self.n_token_seq_len, device=logits.device)
+        token_weights = token_weights.repeat(n_blocks.sum())
+        per_token = per_token * token_weights
 
         batch_ids = torch.arange(logits.size(0), device=logits.device)[:, None].expand_as(block_mask)[block_mask]
         loss_per_sample = torch.zeros(logits.size(0), device=logits.device, dtype=per_token.dtype)
@@ -272,6 +279,9 @@ def main(args: Arguments):
             max_blocks=args.max_blocks,
         ),
         n_token_seq_len=n_token_seq_len,
+        distill_temperature=args.distill_temperature,
+        ar_loss_weight=args.ar_loss_weight,
+        consistency_scale=args.consistency_scale,
     )
 
     if any(Path(args.output_dir).glob("checkpoint-*")):
