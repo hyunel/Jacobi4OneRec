@@ -1,5 +1,6 @@
 #%%
 # Load and inspect the generated trajectories
+import numpy as np
 import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -39,7 +40,6 @@ print(f"Loaded {len(df)} trajectories from {PATH}")
 
 #%%
 # Roll 5 samples for inspection
-import numpy as np
 from transformers import AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)

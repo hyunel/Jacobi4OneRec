@@ -8,7 +8,7 @@ image = (
     .add_local_file("01_generate.py", remote_path="/root/01_generate.py")
     .add_local_file("patch.py", remote_path="/root/patch.py")
     .add_local_file("03_train.py", remote_path="/root/03_train.py")
-    .add_local_file("ds_config.json", remote_path="/root/ds_config.json")
+    .add_local_file("configs/ds_config.json", remote_path="/root/configs/ds_config.json")
 )
 
 app = modal.App(

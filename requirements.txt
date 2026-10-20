@@ -1,9 +1,12 @@
 datasets
 torch
 pyarrow
+pandas
+numpy
 transformers
 rich
 accelerate
 deepspeed
 peft
 wandb
+xxhash

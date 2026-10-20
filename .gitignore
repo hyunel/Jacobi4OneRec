@@ -1,11 +1,24 @@
+# Data / checkpoints / experiment outputs (everything local goes to outputs/)
+outputs/
+data/
+logs/
+wandb/
 *.parquet
 *.safetensors
 *.pt
 *.bin
+*.sqlite
+
+# Python
 __pycache__/
-logs/
-data/
-wandb/
-outputs/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+
+# Environments / editors
 .venv/
 .vscode/
+.idea/
+.DS_Store

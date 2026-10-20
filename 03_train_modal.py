@@ -49,7 +49,7 @@ def launch_torchrun():
                 "--warmup_ratio", "0.03",
                 "--lr_scheduler_type", "cosine",
                 "--logging_steps", "10",
-                "--deepspeed", "ds_config.json",
+                "--deepspeed", "configs/ds_config.json",
             ]
         )
     )

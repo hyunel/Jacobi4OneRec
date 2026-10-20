@@ -17,13 +17,13 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-$SCRIPT_DIR/.venv/bin/python}"
 
-# Constants for 02_window.py required arguments.
-WINDOW_SIZE=16
-BLOCK_SLIDE_STEP=1
-MIN_NOISY_RATIO=0.5
-MAX_NOISY_RATIO=1.0
-N_TOKEN_SEQ_LENGTH=32
-STRATEGY="progressive"
+# Constants for 02_window.py arguments (override via environment variables).
+WINDOW_SIZE="${WINDOW_SIZE:-16}"
+BLOCK_SLIDE_STEP="${BLOCK_SLIDE_STEP:-32}"
+MIN_NOISY_RATIO="${MIN_NOISY_RATIO:-0.5}"
+MAX_NOISY_RATIO="${MAX_NOISY_RATIO:-1.0}"
+N_TOKEN_SEQ_LENGTH="${N_TOKEN_SEQ_LENGTH:-32}"
+STRATEGY="${STRATEGY:-progressive}"
 
 OUTPUT_DIR="${OUTPUT_DIR:-${INPUT_DIR%/}_n${N_TOKEN_SEQ_LENGTH}w${WINDOW_SIZE}s${BLOCK_SLIDE_STEP}}"
 mkdir -p "$OUTPUT_DIR"
